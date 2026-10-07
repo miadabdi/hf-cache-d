@@ -24,7 +24,9 @@ BUCKET="${S3_BUCKET:-test-bucket}"
 # Master address as seen from INSIDE the container.
 # The in-container port never changes even when the host port is remapped.
 MASTER="localhost:9333"
-S3_ENDPOINT="${S3_TEST_ENDPOINT:-http://localhost:8333}"
+# Default endpoint derives from the compose host port so override mode
+# (SEAWEEDFS_S3_PORT=18333) polls OUR gateway, not whatever squats 8333.
+S3_ENDPOINT="${S3_TEST_ENDPOINT:-http://localhost:${SEAWEEDFS_S3_PORT:-8333}}"
 ACCESS_KEY="${S3_ACCESS_KEY:-test}"
 SECRET_KEY="${S3_SECRET_KEY:-test12345678}"
 

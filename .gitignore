@@ -1,0 +1,6 @@
+# Real env values (deploy/config.example.env is the committed template).
+.env
+deploy/.env
+
+# Built binary.
+/hf-cache-d

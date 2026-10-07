@@ -102,7 +102,8 @@ func TestBackendErrorIsNotErrNotFound(t *testing.T) {
 	newTestStore(t) // asserts the endpoint is reachable; skip if not
 	// A store pointed at a nonexistent bucket surfaces a backend error,
 	// which must NOT be confused with ErrNotFound for an object miss.
-	bad, err := New(testEndpoint(), "no-such-bucket-xyz", "test", "test12345678")
+	accessKey, secretKey, _ := fixtureCreds()
+	bad, err := New(testEndpoint(), "no-such-bucket-xyz", accessKey, secretKey)
 	if err != nil {
 		t.Fatal(err)
 	}
