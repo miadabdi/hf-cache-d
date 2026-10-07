@@ -1,0 +1,20 @@
+# Dev/test fixture only: single-node SeaweedFS running master+volume+S3
+# gateway in one container ("server -s3"). Not a production deployment.
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    container_name: hf-cache-d-seaweedfs
+    command: 'server -s3 -dir /data -volume.max 0 -master.volumeSizeLimitMB 1024'
+    # S3 credentials are NOT set here: this image ignores WEED_S3_* env for
+    # the bundled credential store. scripts/dev-s3.sh registers the static
+    # key pair via `s3.configure` (weed shell), which persists in the volume.
+    ports:
+      # Host ports overridable so the fixture can coexist with other local
+      # SeaweedFS stacks; defaults match the brief (S3 at localhost:8333).
+      - "${SEAWEEDFS_S3_PORT:-8333}:8333" # S3 gateway
+      - "${SEAWEEDFS_MASTER_PORT:-9333}:9333" # master (readiness)
+    volumes:
+      - seaweedfs_data:/data
+
+volumes:
+  seaweedfs_data:

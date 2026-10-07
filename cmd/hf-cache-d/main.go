@@ -72,8 +72,8 @@ func newMux() *http.ServeMux {
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		allowMethods(w, http.MethodGet, http.MethodHead)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version})
@@ -91,10 +91,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func allowMethods(w http.ResponseWriter, methods ...string) {
-	for _, m := range methods {
-		w.Header().Add("Allow", m)
-	}
 }

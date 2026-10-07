@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // ErrNotFound is returned when the requested object does not exist.
@@ -126,19 +125,28 @@ func (s *Store) Head(ctx context.Context, key string) (bool, int64, error) {
 }
 
 // isNotFound maps missing-object responses onto the ErrNotFound sentinel.
-// GetObject surfaces a typed NoSuchKey (or NoSuchBucket); HeadObject has no
-// typed error for 404, so the HTTP status is inspected directly.
+//
+// Error shapes observed (aws-sdk-go-v2, SeaweedFS gateway):
+//   - GetObject missing key:    typed *types.NoSuchKey or generic code "NoSuchKey"
+//   - HeadObject missing key:   bare 404 (HEAD has no body, no code at all)
+//   - missing bucket:           typed *types.NoSuchBucket or code "NoSuchBucket"
+//
+// A missing bucket (or any non-404 status) is deliberately NOT mapped: it is
+// a backend/config error, never "object not found". Matching is by S3 error
+// code string, because SeaweedFS deserializes to smithy.GenericAPIError
+// rather than the SDK's typed exceptions.
 func isNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	var nsk *s3types.NoSuchKey
-	if errors.As(err, &nsk) {
-		return true
-	}
-	var nf *s3types.NotFound
-	if errors.As(err, &nf) {
-		return true
+	var apiErr interface{ ErrorCode() string }
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		case "NoSuchBucket", "NoSuchLifecycleConfiguration", "NoSuchTagSet":
+			return false
+		}
 	}
 	var respErr interface{ HTTPStatusCode() int }
 	if errors.As(err, &respErr) {
