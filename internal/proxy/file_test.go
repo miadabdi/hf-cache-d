@@ -721,6 +721,79 @@ func TestDetachedFetchOutlivesClientTimeout(t *testing.T) {
 	}, "detached manifest entry past metadata client timeout")
 }
 
+// TestVanishedObjectSelfHeals: the manifest says a file exists but its S3
+// object was deleted (data loss / retention sweep). The manifest is the
+// authority for what SHOULD exist; store.Head is the authority for what
+// DOES. HEAD and ranged GET must fall through to the upstream miss path
+// and re-populate — never a false HIT 200 or a bogus 416.
+func TestVanishedObjectSelfHeals(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := []byte("0123456789abcdef")
+	addFile(t, f, "v.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	key := fileKey(sha1, "org/name", "v.bin")
+	proxyGet(t, srv.URL+"/org/name/resolve/main/v.bin", nil)
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files != nil && files["v.bin"] != ""
+	}, "seed manifest entry")
+
+	// The object vanishes; the manifest entry survives.
+	st.delete(key)
+
+	// HEAD must self-heal to the upstream miss, not claim HIT.
+	req, _ := http.NewRequest(http.MethodHead, srv.URL+"/org/name/resolve/main/v.bin", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("vanished-object HEAD status = %d, want 200 (upstream miss path)", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Cache"); got != "MISS" {
+		t.Errorf("vanished-object HEAD X-Cache = %q, want MISS (store.Head must gate the HIT)", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != fmt.Sprint(len(body)) {
+		t.Errorf("vanished-object HEAD Content-Length = %q, want %d (upstream truth)", got, len(body))
+	}
+
+	// A GET now re-populates the vanished object (HEAD never caches).
+	resp2, got2 := proxyGet(t, srv.URL+"/org/name/resolve/main/v.bin", nil)
+	if resp2.Header.Get("X-Cache") != "MISS" {
+		t.Fatalf("re-populating GET X-Cache = %q, want MISS", resp2.Header.Get("X-Cache"))
+	}
+	if !bytes.Equal(got2, body) {
+		t.Errorf("re-populating body = %q", got2)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return st.has(key)
+	}, "re-populated object")
+	resp3, _ := proxyGet(t, srv.URL+"/org/name/resolve/main/v.bin", nil)
+	if resp3.Header.Get("X-Cache") != "HIT" {
+		t.Fatalf("post-repopulation GET X-Cache = %q, want HIT", resp3.Header.Get("X-Cache"))
+	}
+
+	// Vanish again and probe the ranged path the same way: a ranged GET on
+	// a vanished object must self-heal via the upstream passthrough, not
+	// fabricate a 206/416 from manifest metadata alone.
+	st.delete(key)
+	resp4, got4 := proxyGet(t, srv.URL+"/org/name/resolve/main/v.bin", map[string]string{"Range": "bytes=3-7"})
+	if resp4.StatusCode != http.StatusPartialContent {
+		t.Fatalf("vanished-object ranged GET status = %d, want 206 (passthrough)", resp4.StatusCode)
+	}
+	if !bytes.Equal(got4, []byte("34567")) {
+		t.Errorf("vanished-object ranged body = %q, want 34567", got4)
+	}
+	if xc := resp4.Header.Get("X-Cache"); xc != "MISS" {
+		t.Errorf("vanished-object ranged GET X-Cache = %q, want MISS", xc)
+	}
+}
+
 // waitFor polls cond every 10ms until true or timeout.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) bool {
 	t.Helper()

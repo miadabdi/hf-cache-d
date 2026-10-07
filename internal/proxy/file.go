@@ -287,13 +287,12 @@ func (p *Proxy) muFor(sha string) *sync.Mutex {
 
 // ---- serving: cache hit ----
 
-// serveHit serves a manifest-backed object. HEAD answers from headers only
-// (Content-Length from the manifest's Sizes; a store.Head only when the
-// size is unknown — legacy manifests); GET streams from the store,
-// honoring a single satisfiable "bytes=a-b" range with 206, answering 416
-// on an unsatisfiable start, and ignoring malformed/multi/suffix ranges
-// (full 200), like the HF CDN. A vanished object (manifest says yes, store
-// says no) self-heals onto the miss path.
+// serveHit serves a manifest-backed object. The manifest is authoritative
+// for what SHOULD exist, but store.Head gates existence on the HEAD and
+// ranged paths: an object that vanished from the store while its manifest
+// entry survives self-heals onto the upstream miss path instead of a false
+// HIT. (The full-GET path discovers the same through store.Get ErrNotFound.)
+// Manifest Sizes back-fill the length only when Head reports none.
 func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file, key, sum string, size int64) {
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
@@ -302,17 +301,17 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 	h.Set("ETag", `"`+sum+`"`)
 
 	if r.Method == http.MethodHead {
-		if size <= 0 {
-			exists, hsize, err := p.store.Head(r.Context(), key)
-			if err != nil {
-				log.Printf("store head %s: %v", key, err)
-				p.writeErr(w, http.StatusInternalServerError, "internal error")
-				return
-			}
-			if !exists {
-				p.serveHeadMiss(w, r, repo, sha, file)
-				return
-			}
+		exists, hsize, err := p.store.Head(r.Context(), key)
+		if err != nil {
+			log.Printf("store head %s: %v", key, err)
+			p.writeErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if !exists {
+			p.serveHeadMiss(w, r, repo, sha, file)
+			return
+		}
+		if hsize > 0 {
 			size = hsize
 		}
 		h.Set("Content-Length", strconv.FormatInt(size, 10))
@@ -321,17 +320,17 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 	}
 
 	if rg := r.Header.Get("Range"); rg != "" {
-		if size <= 0 {
-			exists, hsize, err := p.store.Head(r.Context(), key)
-			if err != nil {
-				log.Printf("store head %s: %v", key, err)
-				p.writeErr(w, http.StatusInternalServerError, "internal error")
-				return
-			}
-			if !exists {
-				p.serveGetMiss(w, r, repo, sha, file, key)
-				return
-			}
+		exists, hsize, err := p.store.Head(r.Context(), key)
+		if err != nil {
+			log.Printf("store head %s: %v", key, err)
+			p.writeErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if !exists {
+			p.serveGetMiss(w, r, repo, sha, file, key)
+			return
+		}
+		if hsize > 0 {
 			size = hsize
 		}
 		if start, end, ok := parseByteRange(rg, size); ok {
@@ -342,6 +341,11 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 			}
 			rc, err := p.store.GetRange(r.Context(), key, start, end+1)
 			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					// Vanished between Head and GetRange: self-heal.
+					p.serveGetMiss(w, r, repo, sha, file, key)
+					return
+				}
 				log.Printf("store get range %s: %v", key, err)
 				p.writeErr(w, http.StatusInternalServerError, "internal error")
 				return

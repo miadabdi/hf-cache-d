@@ -305,6 +305,13 @@ func (m *memStore) has(key string) bool {
 	return ok
 }
 
+// delete removes an object, simulating S3 data loss / retention sweep.
+func (m *memStore) delete(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.objs, key)
+}
+
 func (m *memStore) keys() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
