@@ -1,6 +1,7 @@
-// Package proxy serves the public Hugging Face metadata lane: repo info and
-// tree listings resolved to commit SHAs, fetched anonymously from upstream,
-// and cached pinned by SHA in the S3 store.
+// Package proxy serves the public Hugging Face lanes: repo info and tree
+// listings (metadata lane) plus file resolve with tee-through caching (file
+// lane), fetched anonymously from upstream and cached pinned by commit SHA
+// in the S3 store.
 package proxy
 
 import (
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miadabdi/hf-cache-d/internal/manifest"
 	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
@@ -27,7 +29,9 @@ import (
 // passes *store.Store, which satisfies it implicitly. Tasks 3/4 reuse it.
 type storeAPI interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, int64, error)
+	GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error)
 	Put(ctx context.Context, key string, r io.Reader, size int64) error
+	Head(ctx context.Context, key string) (bool, int64, error)
 }
 
 var _ storeAPI = (*store.Store)(nil)
@@ -35,7 +39,7 @@ var _ storeAPI = (*store.Store)(nil)
 // refTTL is how long a floating-ref → commit mapping is trusted.
 const refTTL = 5 * time.Minute
 
-// Proxy serves the public metadata routes for one upstream.
+// Proxy serves the public metadata and file routes for one upstream.
 type Proxy struct {
 	upstream string
 	store    storeAPI
@@ -46,6 +50,11 @@ type Proxy struct {
 	refs map[string]refEntry // "repo/rev" -> commit + expiry
 	// ponytail: unbounded ref map, LRU/eviction if repo count grows.
 
+	// File-lane state (Task 3).
+	manMu     sync.Mutex
+	manifests map[string]*manifest.Manifest // sha -> read cache
+	relMu     sync.Mutex
+	releaseMu map[string]*sync.Mutex // sha -> manifest RMW lock
 }
 
 type refEntry struct {
@@ -56,17 +65,20 @@ type refEntry struct {
 // New builds a Proxy against the given HF upstream base URL and store.
 func New(upstream string, st storeAPI) *Proxy {
 	return &Proxy{
-		upstream: strings.TrimRight(upstream, "/"),
-		store:    st,
-		client:   &http.Client{Timeout: 60 * time.Second},
-		now:      time.Now,
-		refs:     map[string]refEntry{},
+		upstream:  strings.TrimRight(upstream, "/"),
+		store:     st,
+		client:    &http.Client{Timeout: 60 * time.Second},
+		now:       time.Now,
+		refs:      map[string]refEntry{},
+		manifests: map[string]*manifest.Manifest{},
+		releaseMu: map[string]*sync.Mutex{},
 	}
 }
 
 // Register mounts the metadata routes on mux. The /api/models/ subtree is
-// claimed wholesale so the later resolve/file route (Task 3) can live under
-// the same prefix without pattern conflicts.
+// claimed wholesale; the file lane (RegisterFiles) cannot share this mux —
+// see RegisterFiles for the Go 1.22 precedence constraint — so newMux mounts
+// it on a child mux under "/".
 func (p *Proxy) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/models/", p.handleModels)
 }

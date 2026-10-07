@@ -63,14 +63,28 @@ func main() {
 	}
 }
 
-// newMux builds the HTTP routing table. The /api/models/ subtree belongs to
-// the metadata proxy; later lanes (file resolve, private push) mount under
-// their own prefixes.
+// newMux builds the HTTP routing table.
+//
+// ROUTING ORDER CONTRACT: Go 1.22 ServeMux precedence is specificity-based,
+// not registration-order-based. The file lane's
+// "/{org}/{name}/resolve/{rev}/{file...}" overlaps "/api/models/" (e.g.
+// "/api/models/resolve/x/y") with neither pattern more specific, so
+// co-registering them on one mux panics at startup regardless of order.
+// The file lane therefore lives on a CHILD mux mounted at "/":
+//   - /healthz and /api/models/ (more specific) win on the parent;
+//   - everything else falls through to the file lane, which 404s
+//     non-matching shapes (including /api/models/... never reaches it).
+//
+// /metricsz (Task 5) and the private push lane (Task 4) must mount on the
+// PARENT mux before "/" — or as exact/longer literals, which always win.
 func newMux(p *proxy.Proxy) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
-	p.Register(mux)
-	mux.HandleFunc("/", handleIndex)
+	p.Register(mux) // /api/models/
+	files := http.NewServeMux()
+	p.RegisterFiles(files)
+	mux.Handle("/", files)
+	mux.HandleFunc("/{$}", handleIndex)
 	return mux
 }
 
@@ -93,6 +107,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		"/api/models/{repo}",
 		"/api/models/{repo}/revision/{rev}",
 		"/api/models/{repo}/tree/{rev}",
+		"/{repo}/resolve/{rev}/{file}",
 		"/",
 	}})
 }

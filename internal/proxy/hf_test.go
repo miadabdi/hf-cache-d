@@ -3,12 +3,16 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -37,11 +41,85 @@ type fakeUpstream struct {
 	link      string // Link header attached to cursor-less tree replies
 	gotAuth   string
 	gotCookie string
+
+	// File-lane state (Task 3).
+	files    map[string][]byte // repo-relative path -> body served for repo@main
+	truncate int               // >0: serve only the first N bytes then hang up
+	slow     int               // >0: CDN ms sleep per 8KiB chunk (disconnect tests)
+	cdnSeen  map[string]int    // fake-CDN request counts by path (not query)
+	cdn      *httptest.Server
 }
 
 func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 	t.Helper()
-	f := &fakeUpstream{hits: map[string]int{}, repo: "org/name", main: sha1}
+	f := &fakeUpstream{hits: map[string]int{}, repo: "org/name", main: sha1, files: map[string][]byte{}, cdnSeen: map[string]int{}}
+	f.cdn = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.cdnSeen[r.URL.Path]++
+		// Path shape: /{repo}/resolve/{rev}/{file...}
+		rest, _ := strings.CutPrefix(strings.TrimPrefix(r.URL.Path, "/"+f.repo+"/"), "resolve/")
+		_, fname, _ := strings.Cut(rest, "/")
+		file, truncate, slow := f.files[fname], f.truncate, f.slow
+		f.mu.Unlock()
+		if file == nil {
+			http.NotFound(w, r)
+			return
+		}
+		etag := fmt.Sprintf(`"%s"`, fakeETag(file))
+		w.Header().Set("X-Linked-ETag", etag)
+		w.Header().Set("X-Linked-Size", fmt.Sprint(len(file)))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if r.Method == http.MethodHead {
+			w.WriteHeader(200)
+			return
+		}
+		if rg := r.Header.Get("Range"); rg != "" {
+			start, end, ok := parseTestRange(rg, len(file))
+			if !ok {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(file)))
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(file)))
+			w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(file[start : end+1])
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(file)))
+		w.WriteHeader(200)
+		if slow > 0 {
+			// Drip the body so a cold GET stays in flight long enough for a
+			// client to disconnect mid-download.
+			for off := 0; off < len(file); off += 8192 {
+				end := off + 8192
+				if end > len(file) {
+					end = len(file)
+				}
+				w.Write(file[off:end])
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(time.Duration(slow) * time.Millisecond)
+			}
+			return
+		}
+		if truncate > 0 && truncate < len(file) {
+			w.Write(file[:truncate])
+			// Hang up mid-body: connection closed before Content-Length is
+			// satisfied, exactly like an upstream truncation.
+			hj, ok := w.(http.Hijacker)
+			if ok {
+				conn, _, err := hj.Hijack()
+				if err == nil {
+					conn.Close()
+				}
+			}
+			return
+		}
+		w.Write(file)
+	}))
+	t.Cleanup(f.cdn.Close)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.hits[r.URL.Path+"?"+r.URL.RawQuery]++
@@ -74,10 +152,59 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 			w.Write([]byte(`[{"type":"file","path":"page2.bin"}]`))
 			return
 		}
+		// File lane: /{repo}/resolve/{rev}/{file} → 302 to the fake CDN,
+		// mirroring how HF hands files to its CDN. The hub server never
+		// serves file bodies itself.
+		if _, ok := strings.CutPrefix(r.URL.Path, "/"+repo+"/resolve/"); ok {
+			if f.files == nil || len(f.files) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Location", f.cdn.URL+r.URL.Path)
+			w.WriteHeader(http.StatusFound)
+			return
+		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
 	return srv, f
+}
+
+// fakeETag is the deterministic etag the fake CDN stamps on a body: the
+// first 32 hex chars of its sha256, quoted like HF's X-Linked-ETag.
+func fakeETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])[:32]
+}
+
+// parseTestRange parses a single "bytes=a-b" range against a body length.
+func parseTestRange(rg string, size int) (start, end int, ok bool) {
+	rg, found := strings.CutPrefix(rg, "bytes=")
+	if !found || strings.Contains(rg, ",") {
+		return 0, 0, false
+	}
+	a, b, found := strings.Cut(rg, "-")
+	if !found {
+		return 0, 0, false
+	}
+	if a == "" {
+		return 0, 0, false // suffix ranges unused in tests
+	}
+	start, err := strconv.Atoi(a)
+	if err != nil || start < 0 {
+		return 0, 0, false
+	}
+	end, err = strconv.Atoi(b)
+	if err != nil || end < start {
+		return 0, 0, false
+	}
+	if start >= size {
+		return 0, 0, false
+	}
+	if end >= size {
+		end = size - 1
+	}
+	return start, end, true
 }
 
 func (f *fakeUpstream) count(key string) int {
@@ -107,8 +234,9 @@ func (f *fakeUpstream) repoOf() string {
 
 // memStore is the in-memory storeAPI fake used by offline tests.
 type memStore struct {
-	mu   sync.Mutex
-	objs map[string][]byte
+	mu      sync.Mutex
+	objs    map[string][]byte
+	failPut bool // every Put returns an error (S3 failure simulation)
 }
 
 func newMemStore() *memStore { return &memStore{objs: map[string][]byte{}} }
@@ -123,7 +251,30 @@ func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, int64, err
 	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
 
+func (m *memStore) GetRange(_ context.Context, key string, start, end int64) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.objs[key]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if start < 0 || end <= start || end > int64(len(b)) {
+		return nil, fmt.Errorf("invalid range [%d,%d) for %d bytes", start, end, len(b))
+	}
+	return io.NopCloser(bytes.NewReader(b[start:end])), nil
+}
+
+func (m *memStore) Head(_ context.Context, key string) (bool, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.objs[key]
+	return ok, int64(len(b)), nil
+}
+
 func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64) error {
+	if m.failNow() {
+		return errors.New("memstore: simulated put failure")
+	}
 	b, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -132,6 +283,12 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64) erro
 	defer m.mu.Unlock()
 	m.objs[key] = b
 	return nil
+}
+
+func (m *memStore) failNow() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failPut
 }
 
 func (m *memStore) has(key string) bool {
@@ -169,6 +326,11 @@ func newTestProxy(t *testing.T, upstream string, st *memStore) (*Proxy, *fakeClo
 func newTestServer(p *Proxy) *httptest.Server {
 	mux := http.NewServeMux()
 	p.Register(mux)
+	// File lane on a child mux under "/": see RegisterFiles for why it
+	// cannot share the main mux with /api/models/.
+	files := http.NewServeMux()
+	p.RegisterFiles(files)
+	mux.Handle("/", files)
 	return httptest.NewServer(mux)
 }
 

@@ -24,8 +24,14 @@ type nopStore struct{}
 func (nopStore) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	return nil, 0, store.ErrNotFound
 }
+func (nopStore) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {
+	return nil, store.ErrNotFound
+}
 func (nopStore) Put(ctx context.Context, key string, r io.Reader, size int64) error {
 	return nil
+}
+func (nopStore) Head(ctx context.Context, key string) (bool, int64, error) {
+	return false, 0, nil
 }
 
 func TestHealthz(t *testing.T) {
@@ -66,8 +72,8 @@ func TestIndexRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	routes := got["routes"]
-	if len(routes) < 5 || routes[0] != "/healthz" || routes[4] != "/" {
-		t.Errorf("routes = %v, want 5 routes incl. /healthz and /", routes)
+	if len(routes) < 6 || routes[0] != "/healthz" || routes[len(routes)-1] != "/" {
+		t.Errorf("routes = %v, want 6 routes incl. /healthz and /", routes)
 	}
 	joined := strings.Join(routes, ",")
 	for _, want := range []string{"/api/models/{repo}", "/revision/{rev}", "/tree/{rev}"} {

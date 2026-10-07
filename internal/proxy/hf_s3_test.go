@@ -8,10 +8,15 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -98,5 +103,107 @@ func TestProxyAgainstRealStore(t *testing.T) {
 	resp4, _ := proxyGet(t, srv.URL+repo+"/tree/main", nil)
 	if resp4.Header.Get("X-Cache") != "HIT" {
 		t.Errorf("tree warm X-Cache = %q, want HIT", resp4.Header.Get("X-Cache"))
+	}
+}
+
+// TestFileLaneAgainstRealStore exercises the resolve lane end to end through
+// real S3: cold GET tee'd into multipart/put streaming, manifest published,
+// warm GET byte-identical with zero upstream file traffic, warm Range from
+// store.GetRange.
+func TestFileLaneAgainstRealStore(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.setRepo(fmt.Sprintf("org/name-%d", time.Now().UnixNano()))
+	// Unique commit sha per run: packages under ./... run in parallel
+	// against one shared bucket, and the manifest key carries only the sha
+	// (a commit sha identifies one repo in reality), so fixtures must not
+	// share one either.
+	uniq := sha256.Sum256([]byte(f.repoOf()))
+	sha := hex.EncodeToString(uniq[:20]) // 40-hex, the commit shape
+	f.mu.Lock()
+	f.main = sha
+	f.mu.Unlock()
+	repo := f.repoOf()
+	st := newComposeStore(t)
+	p := New(up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	body := bytes.Repeat([]byte("0123456789abcdef"), 512*1024) // 8 MiB
+	f.mu.Lock()
+	f.files["big.bin"] = body
+	f.files["nested/dir/file.txt"] = []byte("nested")
+	f.mu.Unlock()
+	sum := sha256.Sum256(body)
+
+	// Cold GET: MISS, byte-identical, streamed into the store.
+	resp1, got1 := proxyGet(t, srv.URL+"/"+repo+"/resolve/main/big.bin", nil)
+	if resp1.StatusCode != 200 || resp1.Header.Get("X-Cache") != "MISS" {
+		t.Fatalf("cold: status=%d X-Cache=%q", resp1.StatusCode, resp1.Header.Get("X-Cache"))
+	}
+	if !bytes.Equal(got1, body) {
+		t.Fatalf("cold body: %d bytes, want %d byte-identical", len(got1), len(body))
+	}
+
+	// Manifest entry published (poll: publish trails the response).
+	deadline := time.Now().Add(10 * time.Second)
+	var files map[string]string
+	for time.Now().Before(deadline) {
+		rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/manifest.json", sha[:2], sha))
+		if err == nil {
+			var m struct {
+				Files map[string]string `json:"files"`
+			}
+			if jerr := json.NewDecoder(rc).Decode(&m); jerr == nil {
+				files = m.Files
+			}
+			rc.Close()
+			if files["big.bin"] == hex.EncodeToString(sum[:]) {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if files["big.bin"] != hex.EncodeToString(sum[:]) {
+		t.Fatalf("manifest after cold GET = %v, want big.bin=%s", files, hex.EncodeToString(sum[:]))
+	}
+
+	// Warm GET: HIT, zero upstream file traffic, byte-identical.
+	f.mu.Lock()
+	f.cdnSeen = map[string]int{}
+	f.mu.Unlock()
+	resp2, got2 := proxyGet(t, srv.URL+"/"+repo+"/resolve/main/big.bin", nil)
+	if resp2.Header.Get("X-Cache") != "HIT" {
+		t.Fatalf("warm X-Cache = %q, want HIT", resp2.Header.Get("X-Cache"))
+	}
+	if !bytes.Equal(got2, body) {
+		t.Error("warm body differs from cold body")
+	}
+	if et := resp2.Header.Get("ETag"); et != `"`+hex.EncodeToString(sum[:])+`"` {
+		t.Errorf("warm ETag = %q, want quoted sha256", et)
+	}
+	if n := len(f.cdnSeen); n != 0 {
+		t.Errorf("upstream file traffic after warm = %d requests", n)
+	}
+
+	// Warm Range served from the store: exact bytes.
+	resp3, got3 := proxyGet(t, srv.URL+"/"+repo+"/resolve/main/big.bin", map[string]string{"Range": "bytes=3-7"})
+	if resp3.StatusCode != http.StatusPartialContent {
+		t.Fatalf("warm range status = %d, want 206", resp3.StatusCode)
+	}
+	if !bytes.Equal(got3, body[3:8]) {
+		t.Errorf("warm range bytes = %q", got3)
+	}
+
+	// Nested path cold pull: separate file entry.
+	proxyGet(t, srv.URL+"/"+repo+"/resolve/main/nested/dir/file.txt", nil)
+
+	// A second full pull pass hits everything from the store only.
+	f.mu.Lock()
+	f.cdnSeen = map[string]int{}
+	f.mu.Unlock()
+	proxyGet(t, srv.URL+"/"+repo+"/resolve/main/big.bin", nil)
+	proxyGet(t, srv.URL+"/"+repo+"/resolve/main/nested/dir/file.txt", nil)
+	if n := len(f.cdnSeen); n != 0 {
+		t.Errorf("second pass upstream file traffic = %d requests, want 0", n)
 	}
 }
