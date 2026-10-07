@@ -498,6 +498,79 @@ func TestInvalidShapes(t *testing.T) {
 	}
 }
 
+func TestQueryAllowlistKeysAndFetch(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// Junk params must not mint new store keys: same canonical key as the
+	// bare request, second call is a cache HIT with zero extra upstream
+	// traffic.
+	resp, _ := proxyGet(t, srv.URL+"/api/models/org/name/tree/main?junk="+sha1, nil)
+	if resp.Header.Get("X-Cache") != "MISS" {
+		t.Fatalf("junk-param first call X-Cache = %q, want MISS", resp.Header.Get("X-Cache"))
+	}
+	resp2, _ := proxyGet(t, srv.URL+"/api/models/org/name/tree/main", nil)
+	if resp2.Header.Get("X-Cache") != "HIT" {
+		t.Errorf("bare second call X-Cache = %q, want HIT (junk param shares the canonical key)", resp2.Header.Get("X-Cache"))
+	}
+	if got := len(st.keys()); got != 1 {
+		t.Errorf("store keys = %v, want exactly 1", st.keys())
+	}
+	if n := f.count("/api/models/org/name/tree/" + sha1 + "?"); n != 1 {
+		t.Errorf("upstream tree fetches = %d, want 1 (junk not forwarded)", n)
+	}
+
+	// Allowlisted variants produce distinct keys...
+	for _, q := range []string{"recursive=true", "expand=false", "limit=100", "cursor=xyz"} {
+		proxyGet(t, srv.URL+"/api/models/org/name/tree/main?"+q, nil)
+	}
+	keys := st.keys()
+	if len(keys) != 5 {
+		t.Errorf("store keys = %v, want 5 (bare + 4 variants)", keys)
+	}
+	for _, k := range keys[1:] {
+		if !strings.Contains(k, "tree.json?") {
+			t.Errorf("variant key %q lost its canonical query", k)
+		}
+	}
+
+	// ...and pass through to upstream (allowlisted, order-independent).
+	proxyGet(t, srv.URL+"/api/models/org/name/tree/main?limit=5&recursive=true&junk=1", nil)
+	if n := f.count("/api/models/org/name/tree/" + sha1 + "?limit=5&recursive=true"); n != 1 {
+		t.Errorf("upstream fetch with allowlisted params = %d, want 1 (got count: %d)", n, f.count("/api/models/org/name/tree/"+sha1+"?limit=5&recursive=true"))
+	}
+	// Reordered params share the canonical key with the previous fetch.
+	resp3, _ := proxyGet(t, srv.URL+"/api/models/org/name/tree/main?recursive=true&limit=5", nil)
+	if resp3.Header.Get("X-Cache") != "HIT" {
+		t.Errorf("reordered params X-Cache = %q, want HIT (canonical key is sorted)", resp3.Header.Get("X-Cache"))
+	}
+}
+
+func TestNon404ClientErrorsNotRetried(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.mu.Lock()
+	f.status = http.StatusTooManyRequests // 429: mapped 502, must NOT retry
+	f.mu.Unlock()
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	resp, _ := proxyGet(t, srv.URL+"/api/models/org/name", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if n := f.count("/api/models/org/name/revision/main?"); n != 1 {
+		t.Errorf("attempts = %d, want 1 (4xx other than 404 is not retried)", n)
+	}
+	if ks := st.keys(); len(ks) != 0 {
+		t.Errorf("429 must not be cached, stored %v", ks)
+	}
+}
+
 func TestNoCredentialsForwarded(t *testing.T) {
 	up, f := newFakeUpstream(t)
 	p, _ := newTestProxy(t, up.URL, newMemStore())

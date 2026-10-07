@@ -44,6 +44,8 @@ type Proxy struct {
 
 	mu   sync.Mutex
 	refs map[string]refEntry // "repo/rev" -> commit + expiry
+	// ponytail: unbounded ref map, LRU/eviction if repo count grows.
+
 }
 
 type refEntry struct {
@@ -75,11 +77,14 @@ func (p *Proxy) Register(mux *http.ServeMux) {
 //
 // S3 key layout (documented contract, reused by Tasks 3/4):
 //
-//	pub/<sha[0:2]>/<sha>/api/models/<org>/<name>/info.json[?<raw query>]
-//	pub/<sha[0:2]>/<sha>/api/models/<org>/<name>/tree.json[?<raw query>]
+//	pub/<sha[0:2]>/<sha>/api/models/<org>/<name>/info.json[?<canonical query>]
+//	pub/<sha[0:2]>/<sha>/api/models/<org>/<name>/tree.json[?<canonical query>]
 //
-// The API response is stored as a "file" under the repo path; query params
-// (pagination cursor, recursive) are part of the key for tree listings.
+// The API response is stored as a "file" under the repo path. The query
+// suffix is the canonical (sorted) encoding of the ALLOWLISTED params only
+// (see allowQuery): pagination cursors and recursive/expand/limit variants
+// get distinct keys, while unknown client params are dropped so arbitrary
+// input cannot mint permanent S3 objects.
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -117,11 +122,40 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One canonical query for both the cache key and the upstream fetch:
+	// same allowlist, same ordering — a hit can never serve the wrong body.
+	q := allowQuery(r.URL.Query())
 	key := fmt.Sprintf("pub/%s/%s/api/models/%s/%s.json", sha[:2], sha, repo, kind)
-	if r.URL.RawQuery != "" {
-		key += "?" + r.URL.RawQuery
+	if enc := q.Encode(); enc != "" {
+		key += "?" + enc
 	}
-	p.servePinned(w, r, repo, sha, key, kind)
+	p.servePinned(w, r, repo, sha, key, kind, q)
+}
+
+// allowedParams are the tree params the HF API actually honors. Anything
+// else a client sends is dropped from both the cache key and the upstream
+// fetch (HF ignores unknown params), so arbitrary input cannot mint
+// unbounded permanent S3 keys.
+var allowedParams = map[string]bool{
+	"recursive": true,
+	"cursor":    true,
+	"expand":    true,
+	"limit":     true,
+}
+
+// allowQuery returns the canonical encoding (params sorted) of the
+// allowlisted subset of q, dropping everything else.
+func allowQuery(q url.Values) url.Values {
+	out := url.Values{}
+	for k, vs := range q {
+		if !allowedParams[k] {
+			continue
+		}
+		for _, v := range vs {
+			out.Add(k, v)
+		}
+	}
+	return out
 }
 
 // cutRepo splits the path remainder after /api/models/ into the {org}/{name}
@@ -154,7 +188,7 @@ var (
 // validRev accepts a 40-hex commit SHA or a branch/tag name. It rejects
 // anything with path-traversal or empty segments.
 func validRev(rev string) bool {
-	if shaRe.MatchString(rev) || rev == "main" {
+	if shaRe.MatchString(rev) {
 		return true
 	}
 	return revSeg.MatchString(rev) && !strings.Contains(rev, "..")
@@ -197,12 +231,12 @@ func (p *Proxy) upstreamSHA(ctx context.Context, repo, rev string) (string, erro
 	}
 	if err := json.Unmarshal(body, &info); err != nil {
 		// Non-JSON 2xx body from upstream is an upstream fault, not ours.
-		return "", &upstreamError{http.StatusBadGateway, "upstream revision response is not JSON"}
+		return "", &upstreamError{status: http.StatusBadGateway, msg: "upstream revision response is not JSON"}
 	}
 	if !shaRe.MatchString(info.SHA) {
 		// Malformed (including empty) sha is an upstream fault, not a
 		// cacheable success and not our bug: surface as 502.
-		return "", &upstreamError{http.StatusBadGateway, "upstream revision response has malformed sha"}
+		return "", &upstreamError{status: http.StatusBadGateway, msg: "upstream revision response has malformed sha"}
 	}
 	return info.SHA, nil
 }
@@ -216,8 +250,9 @@ type cachedResp struct {
 }
 
 // servePinned serves kind's body for repo@sha from the store, fetching and
-// storing on miss. The resolved commit is exposed via X-Repo-Commit.
-func (p *Proxy) servePinned(w http.ResponseWriter, r *http.Request, repo, sha, key, kind string) {
+// storing on miss. The resolved commit is exposed via X-Repo-Commit. q is
+// the allowlisted canonical query used for both key and upstream fetch.
+func (p *Proxy) servePinned(w http.ResponseWriter, r *http.Request, repo, sha, key, kind string, q url.Values) {
 	if body, link, ok := p.readCached(r.Context(), key); ok {
 		p.writeBody(w, r, body, "HIT", sha, link)
 		return
@@ -230,7 +265,7 @@ func (p *Proxy) servePinned(w http.ResponseWriter, r *http.Request, repo, sha, k
 	if kind == "tree" {
 		path = fmt.Sprintf("/api/models/%s/tree/%s", repo, sha)
 	}
-	body, link, err := p.fetch(r.Context(), path, r.URL.Query())
+	body, link, err := p.fetch(r.Context(), path, q)
 	if err != nil {
 		p.fail(w, err)
 		return
@@ -301,17 +336,21 @@ func (p *Proxy) fail(w http.ResponseWriter, err error) {
 	p.writeErr(w, http.StatusInternalServerError, "internal error")
 }
 
-// upstreamError carries a client-facing status for upstream failures.
+// upstreamError carries a client-facing status for upstream failures, plus
+// the upstream's real HTTP status (0 for connection-level failures) so the
+// retry policy can distinguish 5xx (retry) from 4xx (never retry).
 type upstreamError struct {
-	status int
-	msg    string
+	status   int // client-facing status
+	upstream int // real upstream status, 0 = connection failure
+	msg      string
 }
 
 func (e *upstreamError) Error() string { return e.msg }
 
 // fetch performs an anonymous GET against upstream, retrying once on
-// connection errors and 5xx (not on 404). It returns the body and, when
-// present, the upstream Link header.
+// connection errors and 5xx only. 404 and other 4xx (e.g. rate limits) map
+// straight through without retry. It returns the body and, when present, the
+// upstream Link header.
 func (p *Proxy) fetch(ctx context.Context, path string, q url.Values) (body []byte, link string, err error) {
 	// ponytail: 2 attempts total, no backoff — retry policy per plan.
 	for attempt := 0; ; attempt++ {
@@ -319,11 +358,19 @@ func (p *Proxy) fetch(ctx context.Context, path string, q url.Values) (body []by
 		if err == nil {
 			return body, link, nil
 		}
-		var ue *upstreamError
-		if attempt == 1 || errors.As(err, &ue) && ue.status == http.StatusNotFound {
+		if attempt == 1 || !retriable(err) {
 			return nil, "", err
 		}
 	}
+}
+
+// retriable reports whether err is a connection failure or an upstream 5xx.
+func retriable(err error) bool {
+	var ue *upstreamError
+	if errors.As(err, &ue) {
+		return ue.upstream == 0 || ue.upstream >= 500
+	}
+	return false // bare errors (e.g. request build) are not retried
 }
 
 func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byte, string, error) {
@@ -339,18 +386,18 @@ func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byt
 	// Cookie headers never reach upstream.
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, "", &upstreamError{http.StatusBadGateway, "upstream unreachable"}
+		return nil, "", &upstreamError{status: http.StatusBadGateway, msg: "upstream unreachable"}
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, "", &upstreamError{http.StatusNotFound, "not found upstream"}
+		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream"}
 	case resp.StatusCode >= 400:
-		return nil, "", &upstreamError{http.StatusBadGateway, "upstream error"}
+		return nil, "", &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream error"}
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", &upstreamError{http.StatusBadGateway, "upstream read error"}
+		return nil, "", &upstreamError{status: http.StatusBadGateway, msg: "upstream read error"}
 	}
 	return body, resp.Header.Get("Link"), nil
 }
