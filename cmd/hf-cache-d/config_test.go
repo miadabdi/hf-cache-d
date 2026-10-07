@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLoadConfigMissingRequired(t *testing.T) {
 	required := []string{"S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY", "S3_SECRET_KEY"}
@@ -14,7 +17,7 @@ func TestLoadConfigMissingRequired(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error when %s is empty", name)
 			}
-			if !contains(err.Error(), name) {
+			if !strings.Contains(err.Error(), name) {
 				t.Errorf("error %q does not mention %s", err, name)
 			}
 		})
@@ -43,13 +46,4 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.PushToken != "" {
 		t.Errorf("PushToken = %q, want empty", cfg.PushToken)
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
