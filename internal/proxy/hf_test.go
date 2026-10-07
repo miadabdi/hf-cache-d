@@ -234,12 +234,19 @@ func (f *fakeUpstream) repoOf() string {
 
 // memStore is the in-memory storeAPI fake used by offline tests.
 type memStore struct {
-	mu      sync.Mutex
-	objs    map[string][]byte
-	failPut bool // every Put returns an error (S3 failure simulation)
+	mu          sync.Mutex
+	objs        map[string][]byte
+	failPut     bool            // every Put returns an error (S3 failure simulation)
+	failPutKeys map[string]bool // only these keys fail (targeted failure)
 }
 
 func newMemStore() *memStore { return &memStore{objs: map[string][]byte{}} }
+
+func (m *memStore) setFailPut(keys map[string]bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failPutKeys = keys
+}
 
 func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, int64, error) {
 	m.mu.Lock()
@@ -272,7 +279,7 @@ func (m *memStore) Head(_ context.Context, key string) (bool, int64, error) {
 }
 
 func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64) error {
-	if m.failNow() {
+	if m.failNow(key) {
 		return errors.New("memstore: simulated put failure")
 	}
 	b, err := io.ReadAll(r)
@@ -285,10 +292,10 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64) erro
 	return nil
 }
 
-func (m *memStore) failNow() bool {
+func (m *memStore) failNow(key string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.failPut
+	return m.failPut || m.failPutKeys[key]
 }
 
 func (m *memStore) has(key string) bool {

@@ -86,8 +86,8 @@ func (p *Proxy) handleResolveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sum, ok := p.fileSHA(r.Context(), sha, file); ok {
-		p.serveHit(w, r, repo, sha, file, fileKeyOf(sha, repo, file), sum)
+	if sum, size, ok := p.fileEntry(r.Context(), sha, file); ok {
+		p.serveHit(w, r, repo, sha, file, fileKeyOf(sha, repo, file), sum, size)
 		return
 	}
 	if r.Method == http.MethodHead {
@@ -125,28 +125,53 @@ func validFilePath(file string) bool {
 }
 
 // ---- manifest access ----
+//
+// Lock discipline: manMu guards BOTH the manifests map and the Files/Sizes
+// maps of every cached *Manifest (they are shared between readers). Reads
+// take manMu for the map lookup AND the entry lookup. Publishers never
+// mutate a cached manifest in place: they build the merged copy, Put it to
+// the store, and only on success install it into the cache under manMu —
+// a failed Put leaves the cache exactly as it was (no phantom entries).
 
-// fileSHA returns the cached sha256 for repo@sha/file from the release
-// manifest. Misses (no manifest, no entry, undecodable manifest) are not
-// cached negatively: each cold request costs one manifest read.
+// fileEntry looks up the manifest entry for repo@sha/file: its sha256 (our
+// ETag) and byte size. Misses (no manifest, no entry, undecodable manifest)
+// are not cached negatively: each cold request costs one manifest read.
 // ponytail: single-process read cache; a second proxy instance would need
 // to drop it (or add store-side versioning) to stay coherent.
-func (p *Proxy) fileSHA(ctx context.Context, sha, file string) (string, bool) {
+func (p *Proxy) fileEntry(ctx context.Context, sha, file string) (sum string, size int64, ok bool) {
 	p.manMu.Lock()
-	m, ok := p.manifests[sha]
+	m, cached := p.manifests[sha]
+	if cached {
+		defer p.manMu.Unlock()
+		sum, ok = m.Files[file]
+		if ok {
+			return sum, m.Sizes[file], true
+		}
+		return "", 0, false
+	}
 	p.manMu.Unlock()
-	if !ok {
-		m = p.loadManifest(ctx, sha)
-	}
+
+	// Cache miss: load from the store, then install without clobbering a
+	// concurrently-installed newer entry.
+	m = p.loadManifest(ctx, sha)
 	if m == nil {
-		return "", false
+		return "", 0, false
 	}
-	sum, ok := m.Files[file]
-	return sum, ok
+	m = p.installIfNewer(sha, m)
+	p.manMu.Lock()
+	defer p.manMu.Unlock()
+	sum, ok = m.Files[file]
+	if !ok {
+		return "", 0, false
+	}
+	return sum, m.Sizes[file], true
 }
 
-// loadManifest reads manifest.json for sha from the store and caches it.
-// A missing or corrupt manifest yields nil (self-heals on next publish).
+// loadManifest reads manifest.json for sha from the store and returns it
+// WITHOUT caching (the caller decides). A missing or corrupt manifest
+// yields nil (self-heals on next publish). The S3 read happens outside
+// manMu; installIfNewer below serializes the install against concurrent
+// publishers so a stale read can never overwrite a newer cached manifest.
 func (p *Proxy) loadManifest(ctx context.Context, sha string) *manifest.Manifest {
 	rc, _, err := p.store.Get(ctx, manifestKeyOf(sha))
 	if err != nil {
@@ -158,17 +183,41 @@ func (p *Proxy) loadManifest(ctx context.Context, sha string) *manifest.Manifest
 		log.Printf("manifest for %s not valid, treating as absent", sha)
 		return nil
 	}
-	p.manMu.Lock()
-	p.manifests[sha] = &m
-	p.manMu.Unlock()
 	return &m
 }
 
-// publishFile merges file→sum into the release manifest for sha under the
-// per-release mutex (read-modify-write; the store has no CAS). The manifest
-// read here bypasses the read cache only in the sense that it re-reads the
-// store's current object: under the lock, this process is the only writer.
-func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string) {
+// installIfNewer caches m for sha unless a manifest with a superset of
+// entries is already cached (a concurrent publish won the race). Returns
+// the manifest the cache now holds.
+func (p *Proxy) installIfNewer(sha string, m *manifest.Manifest) *manifest.Manifest {
+	p.manMu.Lock()
+	defer p.manMu.Unlock()
+	if cur, ok := p.manifests[sha]; ok {
+		for file := range m.Files {
+			if _, exists := cur.Files[file]; !exists {
+				// The store read knew a file the cache lacks: merge it in.
+				// (Possible when another process wrote the manifest, or this
+				// read raced a publish that has not installed yet.)
+				cur.Files[file] = m.Files[file]
+				if m.Sizes != nil {
+					if cur.Sizes == nil {
+						cur.Sizes = map[string]int64{}
+					}
+					cur.Sizes[file] = m.Sizes[file]
+				}
+			}
+		}
+		return cur
+	}
+	p.manifests[sha] = m
+	return m
+}
+
+// publishFile merges file→sum (size) into the release manifest for sha.
+// The per-release mutex serializes the store read-modify-write (the store
+// has no CAS); manMu guards the cache install, which happens only after a
+// successful store Put so a failed publish leaves no phantom entry.
+func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string, size int64) {
 	mu := p.muFor(sha)
 	mu.Lock()
 	defer mu.Unlock()
@@ -178,6 +227,7 @@ func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string) {
 		m = &manifest.Manifest{
 			Identity: "hf:" + repo + "@" + sha,
 			Files:    map[string]string{},
+			Sizes:    map[string]int64{},
 			PulledAt: time.Now(),
 			Upstream: p.upstream,
 		}
@@ -185,9 +235,29 @@ func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string) {
 	if _, exists := m.Files[file]; exists {
 		return // a concurrent pull already published this path
 	}
-	m.Files[file] = sum
+	// Build the merged copy: never mutate a shared cached manifest.
+	next := manifest.Manifest{
+		Identity: m.Identity,
+		Files:    make(map[string]string, len(m.Files)+1),
+		Sizes:    make(map[string]int64, len(m.Files)+1),
+		PulledAt: m.PulledAt,
+		Upstream: m.Upstream,
+	}
+	if next.Identity == "" {
+		next.Identity = "hf:" + repo + "@" + sha
+		next.PulledAt = time.Now()
+		next.Upstream = p.upstream
+	}
+	for k, v := range m.Files {
+		next.Files[k] = v
+	}
+	for k, v := range m.Sizes {
+		next.Sizes[k] = v
+	}
+	next.Files[file] = sum
+	next.Sizes[file] = size
 
-	body, err := json.Marshal(m)
+	body, err := json.Marshal(next)
 	if err != nil {
 		log.Printf("manifest marshal %s: %v", sha, err)
 		return
@@ -198,7 +268,7 @@ func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string) {
 		return
 	}
 	p.manMu.Lock()
-	p.manifests[sha] = m
+	p.manifests[sha] = &next
 	p.manMu.Unlock()
 }
 
@@ -217,12 +287,14 @@ func (p *Proxy) muFor(sha string) *sync.Mutex {
 
 // ---- serving: cache hit ----
 
-// serveHit serves a manifest-backed object. HEAD answers from headers only;
-// GET streams from the store, honoring a single satisfiable "bytes=a-b"
-// range with 206, answering 416 on an unsatisfiable start, and ignoring
-// malformed/multi/suffix ranges (full 200), like the HF CDN. A vanished
-// object (manifest says yes, store says no) self-heals onto the miss path.
-func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file, key, sum string) {
+// serveHit serves a manifest-backed object. HEAD answers from headers only
+// (Content-Length from the manifest's Sizes; a store.Head only when the
+// size is unknown — legacy manifests); GET streams from the store,
+// honoring a single satisfiable "bytes=a-b" range with 206, answering 416
+// on an unsatisfiable start, and ignoring malformed/multi/suffix ranges
+// (full 200), like the HF CDN. A vanished object (manifest says yes, store
+// says no) self-heals onto the miss path.
+func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file, key, sum string, size int64) {
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "HIT")
@@ -230,15 +302,18 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 	h.Set("ETag", `"`+sum+`"`)
 
 	if r.Method == http.MethodHead {
-		exists, size, err := p.store.Head(r.Context(), key)
-		if err != nil {
-			log.Printf("store head %s: %v", key, err)
-			p.writeErr(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		if !exists {
-			p.serveHeadMiss(w, r, repo, sha, file)
-			return
+		if size <= 0 {
+			exists, hsize, err := p.store.Head(r.Context(), key)
+			if err != nil {
+				log.Printf("store head %s: %v", key, err)
+				p.writeErr(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if !exists {
+				p.serveHeadMiss(w, r, repo, sha, file)
+				return
+			}
+			size = hsize
 		}
 		h.Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
@@ -246,15 +321,18 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 	}
 
 	if rg := r.Header.Get("Range"); rg != "" {
-		exists, size, err := p.store.Head(r.Context(), key)
-		if err != nil {
-			log.Printf("store head %s: %v", key, err)
-			p.writeErr(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		if !exists {
-			p.serveGetMiss(w, r, repo, sha, file, key)
-			return
+		if size <= 0 {
+			exists, hsize, err := p.store.Head(r.Context(), key)
+			if err != nil {
+				log.Printf("store head %s: %v", key, err)
+				p.writeErr(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if !exists {
+				p.serveGetMiss(w, r, repo, sha, file, key)
+				return
+			}
+			size = hsize
 		}
 		if start, end, ok := parseByteRange(rg, size); ok {
 			if start < 0 {
@@ -476,7 +554,7 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 		log.Printf("store put %s: %v (object is garbage, not published)", key, perr)
 		return
 	}
-	p.publishFile(ctx, repo, sha, file, hex.EncodeToString(hash.Sum(nil)))
+	p.publishFile(ctx, repo, sha, file, hex.EncodeToString(hash.Sum(nil)), relayed)
 }
 
 // relayStatus relays a non-200 upstream GET answer (e.g. a 304 or 404 that
@@ -546,8 +624,10 @@ func (p *Proxy) fetchResp(ctx context.Context, method, path, rangeHdr string) (*
 	if rangeHdr != "" {
 		req.Header.Set("Range", rangeHdr)
 	}
-	// Anonymous: inbound Authorization/Cookie never reach upstream.
-	resp, err := p.client.Do(req)
+	// Anonymous: inbound Authorization/Cookie never reach upstream. The
+	// file client has no overall deadline so detached transfers run to
+	// completion (see the Proxy.fileClient comment).
+	resp, err := p.fileClient.Do(req)
 	if err != nil {
 		return nil, &upstreamError{status: http.StatusBadGateway, msg: "upstream unreachable"}
 	}

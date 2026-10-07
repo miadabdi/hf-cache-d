@@ -43,8 +43,15 @@ const refTTL = 5 * time.Minute
 type Proxy struct {
 	upstream string
 	store    storeAPI
-	client   *http.Client
-	now      func() time.Time
+	client   *http.Client // metadata lane: small bodies, 60s overall deadline
+	// fileClient carries file transfers. No overall deadline: a cold pull
+	// detached from its client request must run to completion however long
+	// the body takes. It is bounded only by the context of the transfer
+	// (server-lifetime for detached cold pulls).
+	// ponytail: unbounded transfer time is the trusted-network ceiling; add
+	// a deadline/semaphore if exposed to untrusted networks.
+	fileClient *http.Client
+	now        func() time.Time
 
 	mu   sync.Mutex
 	refs map[string]refEntry // "repo/rev" -> commit + expiry
@@ -65,13 +72,14 @@ type refEntry struct {
 // New builds a Proxy against the given HF upstream base URL and store.
 func New(upstream string, st storeAPI) *Proxy {
 	return &Proxy{
-		upstream:  strings.TrimRight(upstream, "/"),
-		store:     st,
-		client:    &http.Client{Timeout: 60 * time.Second},
-		now:       time.Now,
-		refs:      map[string]refEntry{},
-		manifests: map[string]*manifest.Manifest{},
-		releaseMu: map[string]*sync.Mutex{},
+		upstream:   strings.TrimRight(upstream, "/"),
+		store:      st,
+		client:     &http.Client{Timeout: 60 * time.Second},
+		fileClient: &http.Client{},
+		now:        time.Now,
+		refs:       map[string]refEntry{},
+		manifests:  map[string]*manifest.Manifest{},
+		releaseMu:  map[string]*sync.Mutex{},
 	}
 }
 

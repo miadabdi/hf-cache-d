@@ -174,6 +174,42 @@ func TestSnapshotSequenceE2E(t *testing.T) {
 	}
 
 	for pass := 1; pass <= 2; pass++ {
+		if pass == 2 {
+			// Deterministic barrier: pass 1's detached publish (object Put +
+			// manifest RMW) may still be in flight when the responses
+			// returned. Every file must be manifest-published and its object
+			// headed before pass 2 can assert HIT/zero-traffic — otherwise
+			// correct code fails the test.
+			deadline := time.Now().Add(30 * time.Second)
+			for _, file := range paths {
+				ok := false
+				for time.Now().Before(deadline) {
+					rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/manifest.json", f.sha[:2], f.sha))
+					if err == nil {
+						var m struct {
+							Files map[string]string `json:"files"`
+						}
+						if json.NewDecoder(rc).Decode(&m) == nil && m.Files[file] == sums[file] {
+							rc.Close()
+							ok = true
+							break
+						}
+					}
+					if rc != nil {
+						rc.Close()
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				if !ok {
+					t.Fatalf("pass 2 barrier: %s never published to the manifest", file)
+				}
+				exists, _, err := st.Head(context.Background(), fmt.Sprintf("pub/%s/%s/%s/%s", f.sha[:2], f.sha, repo, file))
+				if err != nil || !exists {
+					t.Fatalf("pass 2 barrier: object for %s missing (err %v)", file, err)
+				}
+			}
+		}
+
 		// Metadata first, like a real pull.
 		info, _ := http.Get(srv.URL + "/api/models/" + repo)
 		info.Body.Close()
@@ -212,6 +248,7 @@ func TestSnapshotSequenceE2E(t *testing.T) {
 	var m struct {
 		Identity string            `json:"identity"`
 		Files    map[string]string `json:"files"`
+		Sizes    map[string]int64  `json:"sizes"`
 	}
 	if err := json.NewDecoder(rc).Decode(&m); err != nil {
 		t.Fatal(err)
@@ -222,6 +259,9 @@ func TestSnapshotSequenceE2E(t *testing.T) {
 	for _, file := range paths {
 		if m.Files[file] != sums[file] {
 			t.Errorf("manifest Files[%s] = %q, want %q", file, m.Files[file], sums[file])
+		}
+		if m.Sizes[file] != int64(len(files[file])) {
+			t.Errorf("manifest Sizes[%s] = %d, want %d", file, m.Sizes[file], len(files[file]))
 		}
 	}
 

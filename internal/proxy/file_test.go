@@ -522,6 +522,205 @@ func TestPinnedSHADirectFile(t *testing.T) {
 	}
 }
 
+// TestManifestStoresSizes: the durable manifest carries Sizes alongside
+// sha256s (spec: "Store upstream ETag/size with SHA256" — size ledgered,
+// ETag waived), and a warm HEAD after a proxy restart (fresh read cache)
+// answers Content-Length from it without a store.Head.
+func TestManifestStoresSizes(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := []byte("size-me-precisely")
+	addFile(t, f, "s.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	proxyGet(t, srv.URL+"/org/name/resolve/main/s.bin", nil)
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files != nil && files["s.bin"] != ""
+	}, "manifest entry")
+
+	rc, _, err := st.Get(context.Background(), manifestKey(sha1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	var m struct {
+		Files map[string]string `json:"files"`
+		Sizes map[string]int64  `json:"sizes"`
+	}
+	if err := json.NewDecoder(rc).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Sizes["s.bin"] != int64(len(body)) {
+		t.Errorf("manifest Sizes[s.bin] = %d, want %d", m.Sizes["s.bin"], len(body))
+	}
+	if m.Files["s.bin"] == "" {
+		t.Errorf("manifest Files[s.bin] empty")
+	}
+
+	// Fresh proxy (cold read cache) must serve the warm HEAD from the
+	// manifest: Content-Length from Sizes.
+	p2, _ := newTestProxy(t, up.URL, st)
+	srv2 := newTestServer(p2)
+	defer srv2.Close()
+	req, _ := http.NewRequest(http.MethodHead, srv2.URL+"/org/name/resolve/main/s.bin", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Header.Get("X-Cache") != "HIT" {
+		t.Fatalf("fresh-proxy HEAD X-Cache = %q, want HIT", resp.Header.Get("X-Cache"))
+	}
+	if got := resp.Header.Get("Content-Length"); got != fmt.Sprint(len(body)) {
+		t.Errorf("fresh-proxy HEAD Content-Length = %q, want %d (from manifest Sizes)", got, len(body))
+	}
+}
+
+// TestConcurrentPublishAndReads: parallel cold GETs of different files in
+// one release (concurrent manifest publishes) racing concurrent warm
+// HEADs/GETs of already-published files must not corrupt the shared cached
+// manifest (concurrent map read/write) and must leave every entry visible.
+// Run under -race this is the regression test for the publishFile/fileSHA
+// lock discipline.
+func TestConcurrentPublishAndReads(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	for i := 0; i < 6; i++ {
+		addFile(t, f, fmt.Sprintf("c%d.bin", i), bytes.Repeat([]byte{byte('a' + i)}, 64*1024+i))
+	}
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// Warm file 0 first so concurrent readers have something to hit.
+	proxyGet(t, srv.URL+"/org/name/resolve/main/c0.bin", nil)
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files != nil && files["c0.bin"] != ""
+	}, "seed manifest entry")
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 24)
+	// Concurrent publishers: cold GETs of the other files.
+	for i := 1; i < 6; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := http.Get(srv.URL + fmt.Sprintf("/org/name/resolve/main/c%d.bin", i))
+			if err != nil {
+				errs <- err
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}(i)
+	}
+	// Concurrent readers: warm HEADs/GETs of the seeded file.
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Head(srv.URL + "/org/name/resolve/main/c0.bin")
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	// All entries must be present and correct.
+	files := map[string]string{}
+	waitFor(t, 5*time.Second, func() bool {
+		files = readFileManifest(t, st, sha1)
+		return files != nil && len(files) == 6
+	}, "all 6 manifest entries")
+	for i := 0; i < 6; i++ {
+		name := fmt.Sprintf("c%d.bin", i)
+		if files[name] == "" {
+			t.Errorf("manifest missing %s: %v", name, files)
+		}
+	}
+}
+
+// TestNoPhantomHitOnManifestPutFailure: when the manifest Put fails, the
+// read cache must NOT contain the unpublished entry — the next request
+// re-fetches (MISS), never a phantom HIT.
+func TestNoPhantomHitOnManifestPutFailure(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	addFile(t, f, "ph.bin", []byte("phantom guard"))
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// Manifest writes fail, body writes succeed.
+	st.setFailPut(map[string]bool{manifestKey(sha1): true})
+
+	resp, _ := proxyGet(t, srv.URL+"/org/name/resolve/main/ph.bin", nil)
+	if resp.Header.Get("X-Cache") != "MISS" {
+		t.Fatalf("cold X-Cache = %q, want MISS", resp.Header.Get("X-Cache"))
+	}
+	// The read cache must not contain a phantom entry: the next request is
+	// a MISS again (manifest Put failed), never a HIT.
+	resp2, _ := proxyGet(t, srv.URL+"/org/name/resolve/main/ph.bin", nil)
+	if resp2.Header.Get("X-Cache") != "MISS" {
+		t.Fatalf("post-failure X-Cache = %q, want MISS (no phantom HIT)", resp2.Header.Get("X-Cache"))
+	}
+}
+
+// TestDetachedFetchOutlivesClientTimeout: the file lane must use a client
+// with no overall deadline — a detached cold pull runs to completion
+// however long the body takes. Behavioral half: a body dripping past a
+// shrunken METADATA client deadline (proving file transfers don't share
+// it) still caches after the client disconnects; structural half: the
+// default fileClient carries no Timeout.
+func TestDetachedFetchOutlivesClientTimeout(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	// 4 × 8 KiB chunks at 150ms per chunk = 600ms total drip, past the
+	// 200ms metadata-client deadline set below.
+	body := bytes.Repeat([]byte("z"), 4*8192)
+	sum := addFile(t, f, "slow.bin", body)
+	f.mu.Lock()
+	f.slow = 150
+	f.mu.Unlock()
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	if p.fileClient.Timeout != 0 {
+		t.Fatalf("default fileClient.Timeout = %v, want 0 (no overall deadline on file transfers)", p.fileClient.Timeout)
+	}
+	// Shrink the METADATA client's deadline: if the file lane shared it,
+	// this transfer would abort at 200ms.
+	p.client = &http.Client{Timeout: 200 * time.Millisecond}
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/org/name/resolve/main/slow.bin", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := resp.Body.Read(make([]byte, 128))
+	resp.Body.Close()
+	if n == 0 {
+		t.Fatal("client read 0 bytes")
+	}
+
+	waitFor(t, 15*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files != nil && files["slow.bin"] == sum
+	}, "detached manifest entry past metadata client timeout")
+}
+
 // waitFor polls cond every 10ms until true or timeout.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) bool {
 	t.Helper()

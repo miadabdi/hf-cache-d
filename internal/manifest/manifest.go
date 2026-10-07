@@ -13,10 +13,13 @@ import (
 
 // Manifest records one pull of a repo at a commit: the repo@revision
 // identity it was requested under, the files cached by that pull (path →
-// S3 key), when it happened, and which upstream served it.
+// sha256, with byte sizes in Sizes), when it happened, and which upstream
+// served it. Upstream CDN ETags are deliberately NOT stored: they are
+// volatile and sha256 is the ETag this service serves.
 type Manifest struct {
 	Identity string            // e.g. "org/name@main" or "org/name@<40-hex>"
-	Files    map[string]string // repo-relative file path → store key
+	Files    map[string]string // repo-relative file path → sha256 hex
+	Sizes    map[string]int64  // repo-relative file path → byte size
 	PulledAt time.Time
 	Upstream string // upstream base URL the data came from
 }
