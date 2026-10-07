@@ -1,14 +1,35 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/miadabdi/hf-cache-d/internal/proxy"
+	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
+// newTestMux wires the mux with a proxy against a dead upstream: handler
+// tests here never touch the metadata lane's upstream path.
+func newTestMux() *http.ServeMux {
+	return newMux(proxy.New("http://127.0.0.1:0", &nopStore{}))
+}
+
+type nopStore struct{}
+
+func (nopStore) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	return nil, 0, store.ErrNotFound
+}
+func (nopStore) Put(ctx context.Context, key string, r io.Reader, size int64) error {
+	return nil
+}
+
 func TestHealthz(t *testing.T) {
-	srv := httptest.NewServer(newMux())
+	srv := httptest.NewServer(newTestMux())
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/healthz")
@@ -29,7 +50,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestIndexRoutes(t *testing.T) {
-	srv := httptest.NewServer(newMux())
+	srv := httptest.NewServer(newTestMux())
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/")
@@ -45,7 +66,13 @@ func TestIndexRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	routes := got["routes"]
-	if len(routes) < 2 || routes[0] != "/healthz" || routes[1] != "/" {
-		t.Errorf("routes = %v, want [/healthz /]", routes)
+	if len(routes) < 5 || routes[0] != "/healthz" || routes[4] != "/" {
+		t.Errorf("routes = %v, want 5 routes incl. /healthz and /", routes)
+	}
+	joined := strings.Join(routes, ",")
+	for _, want := range []string{"/api/models/{repo}", "/revision/{rev}", "/tree/{rev}"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("routes = %v, want %s listed", routes, want)
+		}
 	}
 }

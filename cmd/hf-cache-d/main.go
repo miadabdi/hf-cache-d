@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miadabdi/hf-cache-d/internal/proxy"
 	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
@@ -30,16 +31,16 @@ func main() {
 		log.Printf("warning: PUSH_TOKEN is empty, push lane disabled")
 	}
 
-	// The store is constructed now to fail fast on missing config, and is
-	// consumed by later tasks (proxy/cache lanes wire it into handlers).
-	_, err = store.New(cfg.S3Endpoint, cfg.S3Bucket, cfg.S3AccessKey, cfg.S3SecretKey)
+	// The store is constructed now to fail fast on missing config; the
+	// metadata proxy lane serves from it, later lanes reuse it.
+	st, err := store.New(cfg.S3Endpoint, cfg.S3Bucket, cfg.S3AccessKey, cfg.S3SecretKey)
 	if err != nil {
 		log.Fatalf("s3 store: %v", err)
 	}
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           newMux(),
+		Handler:           newMux(proxy.New(cfg.HFUpstream, st)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -62,10 +63,13 @@ func main() {
 	}
 }
 
-// newMux builds the HTTP routing table for the service skeleton.
-func newMux() *http.ServeMux {
+// newMux builds the HTTP routing table. The /api/models/ subtree belongs to
+// the metadata proxy; later lanes (file resolve, private push) mount under
+// their own prefixes.
+func newMux(p *proxy.Proxy) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
+	p.Register(mux)
 	mux.HandleFunc("/", handleIndex)
 	return mux
 }
@@ -84,7 +88,13 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"routes": []string{"/healthz", "/"}})
+	writeJSON(w, http.StatusOK, map[string]any{"routes": []string{
+		"/healthz",
+		"/api/models/{repo}",
+		"/api/models/{repo}/revision/{rev}",
+		"/api/models/{repo}/tree/{rev}",
+		"/",
+	}})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
