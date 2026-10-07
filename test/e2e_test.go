@@ -36,7 +36,6 @@ type fakeHub struct {
 	repo     string
 	sha      string // commit served for "main"
 	files    map[string][]byte
-	hits     map[string]int
 	cdnHits  int
 	upstream string
 }
@@ -54,7 +53,7 @@ func newFakeHub(t *testing.T, repo string, files map[string][]byte) *fakeHub {
 	// fixtures must not share one (a real commit sha identifies one repo).
 	uniq := sha256.Sum256([]byte(repo))
 	sha := hex.EncodeToString(uniq[:20]) // 40-hex, the commit shape
-	f := &fakeHub{repo: repo, sha: sha, files: files, hits: map[string]int{}}
+	f := &fakeHub{repo: repo, sha: sha, files: files}
 	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.cdnHits++
@@ -74,7 +73,6 @@ func newFakeHub(t *testing.T, repo string, files map[string][]byte) *fakeHub {
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		f.hits[r.URL.Path]++
 		if p, ok := strings.CutPrefix(r.URL.Path, "/api/models/"+repo+"/revision/"); ok {
 			s := f.sha
 			if p != "main" {

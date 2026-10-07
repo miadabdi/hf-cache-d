@@ -76,7 +76,8 @@ func main() {
 //     non-matching shapes (including /api/models/... never reaches it).
 //
 // /metricsz (Task 5) and the private push lane (Task 4) must mount on the
-// PARENT mux before "/" — or as exact/longer literals, which always win.
+// PARENT mux (as literals or subtrees, which always win over "/"); anything
+// left falls to the file lane.
 func newMux(p *proxy.Proxy) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
