@@ -31,6 +31,21 @@ const (
 // switched to error modes mid-test. The repo defaults to org/name; the
 // compose integration test overrides it so each run starts cache-cold
 // against the shared bucket.
+//
+// ── REAL-HF FIDELITY CHECKLIST ──────────────────────────────────────────
+// Wire shapes real HF sends that this fake MUST reproduce. Two verification
+// rounds were lost to fakes simpler than reality in exactly one detail.
+// When extending this fake, check each line; when a verification round
+// finds a new divergence, ADD IT HERE before fixing the code:
+//
+//	[ ] query params: hf_hub 0.36.x sends ?blobs=True (NOT files_metadata)
+//	[ ] non-LFS 307 hop: X-Linked-ETag = git sha1, NO X-Linked-Size,
+//	    Content-Length = redirect-message length, Location RELATIVE
+//	    (/api/resolve-cache/…) — true size one hop later
+//	[ ] LFS 302 hop: X-Linked-ETag = file sha256 + X-Linked-Size
+//	[ ] xet/LFS CDN hop: own ETag is a CAS hash (NOT the file sha256)
+//	[ ] unknown repo (anonymous request): 401, not 404
+//	[ ] default branch is "main"; bad revisions 404 while repo exists
 type fakeUpstream struct {
 	mu        sync.Mutex
 	hits      map[string]int
@@ -178,9 +193,10 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 		// serves file bodies itself. LFS files (default) get a 302 whose
 		// hop carries X-Linked-ETag (sha256) + X-Linked-Size — what a
 		// no-follow HEAD needs. NON-LFS files get HF's real behavior: a 307
-		// whose hop has NO X-Linked-* and whose Content-Length is the
-		// redirect message body itself (NOT the file size — never trust
-		// it); the truth lives one hop later.
+		// whose hop carries X-Linked-ETag (git sha1) but NO X-Linked-Size,
+		// whose Content-Length is the redirect message body itself (NOT the
+		// file size), and whose Location is RELATIVE (/api/resolve-cache/…)
+		// — Go's client rejects relative URLs unless resolved first.
 		if _, ok := strings.CutPrefix(r.URL.Path, "/"+repo+"/resolve/"); ok {
 			if f.files == nil || len(f.files) == 0 {
 				w.WriteHeader(http.StatusNotFound)
@@ -194,19 +210,41 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 					sum := sha256.Sum256(body)
 					w.Header().Set("X-Linked-ETag", `"`+hex.EncodeToString(sum[:])+`"`)
 					w.Header().Set("X-Linked-Size", fmt.Sprint(len(body)))
+					w.Header().Set("Location", f.cdn.URL+r.URL.Path)
 				} else {
-					// Real-HF fidelity: the non-LFS 307 hop DOES carry an
-					// X-Linked-ETag (the git blob sha1) but NO X-Linked-Size.
-					// A guard keyed on "both missing" never fires against
-					// the real Hub and relays the redirect-message length.
 					w.Header().Set("X-Linked-ETag", `"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"`) // 40-hex git sha1 shape
+					w.Header().Set("Location", "/api/resolve-cache"+r.URL.Path)                   // RELATIVE, like real HF
 				}
+			} else {
+				w.Header().Set("Location", f.cdn.URL+r.URL.Path)
 			}
-			w.Header().Set("Location", f.cdn.URL+r.URL.Path)
 			msg := []byte("Temporary Redirect. The document has moved.")
 			w.Header().Set("Content-Length", fmt.Sprint(len(msg))) // the redirect message's own length, like real HF 307s
 			w.WriteHeader(http.StatusTemporaryRedirect)
 			w.Write(msg)
+			return
+		}
+		// resolve-cache: HF's same-host relative redirect target for non-LFS
+		// files. HEADs here carry the TRUE Content-Length (and an ETag that
+		// is the git sha1, not the file sha256). f.mu is held by the outer
+		// handler — read the map under it, no re-locking.
+		if p, ok := strings.CutPrefix(r.URL.Path, "/api/resolve-cache/"); ok {
+			fname := ""
+			if i := strings.LastIndex(p, "/"); i >= 0 {
+				fname = p[i+1:]
+			}
+			body := f.files[fname]
+			if body != nil {
+				w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("ETag", `"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"`)
+				w.WriteHeader(http.StatusOK)
+				if r.Method != http.MethodHead {
+					w.Write(body)
+				}
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		// Metadata: unknown repos get HF's real answer for anonymous

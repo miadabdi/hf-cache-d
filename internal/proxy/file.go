@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -478,21 +479,31 @@ func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha,
 	// Content-Length is the redirect MESSAGE, not the file. The ONLY
 	// trustworthy size signal is X-Linked-Size: any hop without it → follow
 	// the redirect once and read the true size there. Relaying the message
-	// length breaks snapshot_download's consistency check.
+	// length breaks snapshot_download's consistency check. The 307's
+	// Location is RELATIVE (/api/resolve-cache/…) on the real Hub — resolve
+	// it against the upstream base, or Go's client rejects it outright and
+	// the fallback relays the wrong size (the v0.1.3 blocker).
 	if resp.Header.Get("X-Linked-Size") == "" {
 		if loc := resp.Header.Get("Location"); loc != "" {
+			if u, err := url.Parse(loc); err == nil && !u.IsAbs() {
+				loc = p.upstream + loc
+			}
 			req2, err := http.NewRequestWithContext(r.Context(), http.MethodHead, loc, nil)
-			if err == nil {
-				if r2, err := p.fileClient.Do(req2); err == nil {
-					io.Copy(io.Discard, io.LimitReader(r2.Body, 4<<10))
-					r2.Body.Close()
-					// The final hop knows the true length (and, for xet
-					// files, a CAS ETag — deliberately NOT adopted; the
-					// sha256 truth arrives with the manifest on warm).
-					if v := firstNonEmpty(r2.Header.Get("X-Linked-Size"), r2.Header.Get("Content-Length")); v != "" {
-						p.writeHeadMissHeaders(w, sha, "", v, r2.Header.Get("Content-Type"))
-						return
-					}
+			if err != nil {
+				log.Printf("head follow %s: %v (falling back to hop headers)", repo+"/"+file, err)
+			} else if r2, err := p.fileClient.Do(req2); err != nil {
+				// Loud, never swallowed: a silent fallthrough here is how
+				// the redirect-message length got relayed for two rounds.
+				log.Printf("head follow %s: %v (falling back to hop headers)", repo+"/"+file, err)
+			} else {
+				io.Copy(io.Discard, io.LimitReader(r2.Body, 4<<10))
+				r2.Body.Close()
+				// The final hop knows the true length (and, for xet files,
+				// a CAS ETag — deliberately NOT adopted; the sha256 truth
+				// arrives with the manifest on warm).
+				if v := firstNonEmpty(r2.Header.Get("X-Linked-Size"), r2.Header.Get("Content-Length")); v != "" {
+					p.writeHeadMissHeaders(w, sha, "", v, r2.Header.Get("Content-Type"))
+					return
 				}
 			}
 		}
