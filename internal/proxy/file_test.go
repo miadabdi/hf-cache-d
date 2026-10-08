@@ -994,7 +994,9 @@ func TestXErrorCodeOn404s(t *testing.T) {
 
 	// Metadata lane: unknown repo → HF answers 401 to anonymous requests;
 	// the mirror must surface that as a typed repo-404 (stock clients raise
-	// RepositoryNotFoundError), never an untyped 502.
+	// RepositoryNotFoundError), never an untyped 502. The fake's catch-all
+	// metadata branch (after the known-repo revision handler) answers 401,
+	// and the resolve default-branch fetch scopes its code to the REPO.
 	resp2, _ := proxyGet(t, srv.URL+"/api/models/org/absent-repo", nil)
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Fatalf("absent repo status = %d, want 404 (mapped from upstream 401)", resp2.StatusCode)
@@ -1134,5 +1136,35 @@ func TestColdRangeDoesNotRelayCASETag(t *testing.T) {
 	}
 	if et := resp.Header.Get("ETag"); strings.HasPrefix(et, `"cas-`) {
 		t.Errorf("cold ranged GET relayed CAS ETag %q — must not (warm serves sha256 %q)", et, sum)
+	}
+}
+
+// TestBadRevisionGetsRevisionNotFound (finding 6): an unknown revision on a
+// REAL repo must surface X-Error-Code RevisionNotFound, not RepoNotFound —
+// stock clients raise RevisionNotFoundError vs RepositoryNotFoundError.
+func TestBadRevisionGetsRevisionNotFound(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	addFile(t, f, "f.bin", []byte("body"))
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// The fake upstream 404s the bad-revision resolve; the known repo has
+	// files, so the repo itself exists. The typed code must say REVISION.
+	resp, _ := proxyGet(t, srv.URL+"/api/models/org/name/revision/v99bad", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("bad revision status = %d, want 404", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Error-Code"); got != "RevisionNotFound" {
+		t.Errorf("bad revision X-Error-Code = %q, want RevisionNotFound", got)
+	}
+	// File lane with the same bad revision: same typed code.
+	resp2, _ := proxyGet(t, srv.URL+"/org/name/resolve/v99bad/f.bin", nil)
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("file lane bad revision status = %d, want 404", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("X-Error-Code"); got != "RevisionNotFound" {
+		t.Errorf("file lane bad revision X-Error-Code = %q, want RevisionNotFound", got)
 	}
 }

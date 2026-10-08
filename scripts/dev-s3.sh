@@ -33,6 +33,13 @@ SECRET_KEY="${S3_SECRET_KEY:-test12345678}"
 # Run compose from the repo root regardless of the caller's cwd.
 COMPOSE_FILE="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/docker-compose.yml"
 
+# docker_volume_dir prints the filesystem backing the compose volumes when
+# discoverable, so the free-space assert measures the right disk. Best
+# effort: falls back to docker's default root.
+docker_volume_dir() {
+  docker info --format '{{.DockerRootDir}}' 2>/dev/null
+}
+
 echo "waiting for SeaweedFS S3 at ${S3_ENDPOINT} ..."
 # Any HTTP response (even 403 AccessDenied) means the gateway is up; only
 # connection failures mean "not ready".
@@ -46,6 +53,16 @@ until curl -s -o /dev/null -w '%{http_code}' "${S3_ENDPOINT}" --max-time 2 | gre
   sleep 1
 done
 echo "S3 endpoint is up."
+
+# The dev stack saturates at ~20 GB and then fails SILENTLY (writes report
+# success, reads return errors): assert free space up front so the failure
+# is loud and attributable. Fail below the threshold; warn when close.
+MIN_FREE_MB="${S3_MIN_FREE_MB:-4096}"
+free_kb=$(df -Pk --output=avail "$(docker_volume_dir 2>/dev/null || echo /var/lib/docker)" 2>/dev/null | tail -1 | tr -d ' ')
+if [ -n "$free_kb" ] && [ "$free_kb" -lt $((MIN_FREE_MB * 1024)) ]; then
+  echo "ERROR: only $((free_kb / 1024)) MB free for the SeaweedFS volume (< ${MIN_FREE_MB} MB); the dev stack fails silently when full. Free space or raise the volume, then retry." >&2
+  exit 1
+fi
 
 echo "ensuring bucket ${BUCKET} exists (idempotent) ..."
 # Success prints "created bucket <name>" on stdout. On an existing bucket

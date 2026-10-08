@@ -473,12 +473,13 @@ func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha,
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 
-	// Non-LFS files: HF answers the SHA-pinned resolve with a 307 whose
-	// Content-Length is the redirect MESSAGE, not the file. Never trust a
-	// hop lacking X-Linked-Size: follow the redirect once (fileClient
-	// follows it fully) and read the true size there. A cold HEAD relaying
-	// the message length breaks snapshot_download's consistency check.
-	if resp.Header.Get("X-Linked-Size") == "" && resp.Header.Get("X-Linked-ETag") == "" {
+	// Non-LFS files: HF answers the SHA-pinned resolve with a 307 whose hop
+	// carries an X-Linked-ETag (git sha1) but NO X-Linked-Size, and whose
+	// Content-Length is the redirect MESSAGE, not the file. The ONLY
+	// trustworthy size signal is X-Linked-Size: any hop without it → follow
+	// the redirect once and read the true size there. Relaying the message
+	// length breaks snapshot_download's consistency check.
+	if resp.Header.Get("X-Linked-Size") == "" {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			req2, err := http.NewRequestWithContext(r.Context(), http.MethodHead, loc, nil)
 			if err == nil {

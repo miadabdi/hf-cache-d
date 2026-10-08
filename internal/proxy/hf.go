@@ -293,9 +293,16 @@ func (p *Proxy) resolve(ctx context.Context, repo, rev string) (string, error) {
 }
 
 // upstreamSHA fetches /api/models/{repo}/revision/{rev} and extracts sha.
-// A missing, empty or malformed sha is an error.
+// A missing, empty or malformed sha is an error. Typed 404 scoping: a
+// failing DEFAULT-branch resolve means the repo is gone (RepoNotFound); a
+// failing explicit revision means the revision is gone (RevisionNotFound) —
+// the repo usually exists when a client got its id from a listing.
 func (p *Proxy) upstreamSHA(ctx context.Context, repo, rev string) (string, error) {
-	body, _, err := p.fetch(ctx, fmt.Sprintf("/api/models/%s/revision/%s", repo, rev), nil)
+	code := "RevisionNotFound"
+	if rev == "main" {
+		code = "RepoNotFound"
+	}
+	body, _, err := p.fetchCode(ctx, fmt.Sprintf("/api/models/%s/revision/%s", repo, rev), nil, code)
 	if err != nil {
 		return "", err
 	}
@@ -458,11 +465,21 @@ func (e *upstreamError) Error() string { return e.msg }
 // fetch performs an anonymous GET against upstream, retrying once on
 // connection errors and 5xx only. 404 and other 4xx (e.g. rate limits) map
 // straight through without retry. It returns the body and, when present, the
-// upstream Link header.
+// upstream Link header. The 404 X-Error-Code is caller-scoped: fetchCode
+// for callers that know which entity the path identifies (repo vs
+// revision), RepoNotFound otherwise.
 func (p *Proxy) fetch(ctx context.Context, path string, q url.Values) (body []byte, link string, err error) {
+	return p.fetchC(ctx, path, q, "RepoNotFound")
+}
+
+func (p *Proxy) fetchCode(ctx context.Context, path string, q url.Values, code string) (body []byte, link string, err error) {
+	return p.fetchC(ctx, path, q, code)
+}
+
+func (p *Proxy) fetchC(ctx context.Context, path string, q url.Values, code string) (body []byte, link string, err error) {
 	// ponytail: 2 attempts total, no backoff — retry policy per plan.
 	for attempt := 0; ; attempt++ {
-		body, link, err = p.fetchOnce(ctx, path, q)
+		body, link, err = p.fetchOnce(ctx, path, q, code)
 		if err == nil {
 			return body, link, nil
 		}
@@ -481,7 +498,7 @@ func retriable(err error) bool {
 	return false // bare errors (e.g. request build) are not retried
 }
 
-func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byte, string, error) {
+func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values, code string) ([]byte, string, error) {
 	u := p.upstream + path
 	if enc := q.Encode(); enc != "" {
 		u += "?" + enc
@@ -499,12 +516,12 @@ func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byt
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream", code: "RepoNotFound"}
+		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream", code: code}
 	case resp.StatusCode == http.StatusUnauthorized:
 		// HF answers 401 for anonymous requests to nonexistent/private
 		// repos; to an anonymous mirror that is indistinguishable from
 		// unknown-repo, and stock clients expect the typed 404.
-		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "repository not found", code: "RepoNotFound"}
+		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "repository not found", code: code}
 	case resp.StatusCode >= 400:
 		return nil, "", &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream error"}
 	}

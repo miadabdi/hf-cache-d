@@ -155,7 +155,13 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 			if badSHA {
 				sha = "not-a-sha"
 			}
-			fmt.Fprintf(w, `{"sha":%q,"siblings":[{"rfilename":"f-%s"}]}`, sha, sha[:8])
+			if len(sha) >= 8 {
+				fmt.Fprintf(w, `{"sha":%q,"siblings":[{"rfilename":"f-%s"}]}`, sha, sha[:8])
+			} else {
+				// Short garbage revision (e.g. v99bad): HF 404s these — the
+				// repo exists, the revision does not.
+				w.WriteHeader(http.StatusNotFound)
+			}
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/models/"+repo+"/tree/") {
@@ -183,10 +189,18 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 			rest := strings.TrimPrefix(r.URL.Path, "/"+repo+"/resolve/")
 			fname, _, _ := strings.Cut(strings.TrimPrefix(rest, main+"/"), "/")
 			body, isLFS := f.files[fname], f.lfs[fname]
-			if body != nil && isLFS {
-				sum := sha256.Sum256(body)
-				w.Header().Set("X-Linked-ETag", `"`+hex.EncodeToString(sum[:])+`"`)
-				w.Header().Set("X-Linked-Size", fmt.Sprint(len(body)))
+			if body != nil {
+				if isLFS {
+					sum := sha256.Sum256(body)
+					w.Header().Set("X-Linked-ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+					w.Header().Set("X-Linked-Size", fmt.Sprint(len(body)))
+				} else {
+					// Real-HF fidelity: the non-LFS 307 hop DOES carry an
+					// X-Linked-ETag (the git blob sha1) but NO X-Linked-Size.
+					// A guard keyed on "both missing" never fires against
+					// the real Hub and relays the redirect-message length.
+					w.Header().Set("X-Linked-ETag", `"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"`) // 40-hex git sha1 shape
+				}
 			}
 			w.Header().Set("Location", f.cdn.URL+r.URL.Path)
 			msg := []byte("Temporary Redirect. The document has moved.")
