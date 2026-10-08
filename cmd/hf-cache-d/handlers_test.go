@@ -9,14 +9,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/miadabdi/hf-cache-d/internal/proxy"
 	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
 // newTestMux wires the mux with a proxy against a dead upstream: handler
 // tests here never touch the metadata lane's upstream path.
 func newTestMux() *http.ServeMux {
-	return newMux(proxy.New("http://127.0.0.1:0", &nopStore{}))
+	return newMuxAny("http://127.0.0.1:0", "", &nopStore{})
 }
 
 type nopStore struct{}
@@ -72,8 +71,8 @@ func TestIndexRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	routes := got["routes"]
-	if len(routes) < 6 || routes[0] != "/healthz" || routes[len(routes)-1] != "/" {
-		t.Errorf("routes = %v, want 6 routes incl. /healthz and /", routes)
+	if len(routes) < 9 || routes[0] != "/healthz" || routes[len(routes)-1] != "/" {
+		t.Errorf("routes = %v, want 9 routes incl. /healthz and /", routes)
 	}
 	joined := strings.Join(routes, ",")
 	for _, want := range []string{"/api/models/{repo}", "/revision/{rev}", "/tree/{rev}"} {

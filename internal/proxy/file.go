@@ -80,6 +80,12 @@ func (p *Proxy) handleResolveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Sealed local models shadow the public repo for every revision: check
+	// FIRST, and never fall back to the public flow once sealed.
+	if p.handleResolveFileLocal(w, r, repo, rev, file) {
+		return
+	}
+
 	sha, err := p.resolve(r.Context(), repo, rev)
 	if err != nil {
 		p.fail(w, err)
@@ -87,7 +93,10 @@ func (p *Proxy) handleResolveFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sum, size, ok := p.fileEntry(r.Context(), sha, file); ok {
-		p.serveHit(w, r, repo, sha, file, fileKeyOf(sha, repo, file), sum, size)
+		key := fileKeyOf(sha, repo, file)
+		p.serveHit(w, r, repo, sha, file, key, sum, size,
+			func() { p.serveHeadMiss(w, r, repo, sha, file) },
+			func() { p.serveGetMiss(w, r, repo, sha, file, key) })
 		return
 	}
 	if r.Method == http.MethodHead {
@@ -290,10 +299,12 @@ func (p *Proxy) muFor(sha string) *sync.Mutex {
 // serveHit serves a manifest-backed object. The manifest is authoritative
 // for what SHOULD exist, but store.Head gates existence on the HEAD and
 // ranged paths: an object that vanished from the store while its manifest
-// entry survives self-heals onto the upstream miss path instead of a false
-// HIT. (The full-GET path discovers the same through store.Get ErrNotFound.)
-// Manifest Sizes back-fill the length only when Head reports none.
-func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file, key, sum string, size int64) {
+// entry survives self-heals onto the miss path instead of a false HIT. (The
+// full-GET path discovers the same through store.Get ErrNotFound.) Manifest
+// Sizes back-fill the length only when Head reports none. onMiss/onGetMiss
+// are the lane-specific miss continuations (upstream fetch for the public
+// lane, 404 for local models — a sealed local file has no upstream).
+func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file, key, sum string, size int64, onMiss, onGetMiss func()) {
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "HIT")
@@ -308,7 +319,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 			return
 		}
 		if !exists {
-			p.serveHeadMiss(w, r, repo, sha, file)
+			onMiss()
 			return
 		}
 		if hsize > 0 {
@@ -327,7 +338,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 			return
 		}
 		if !exists {
-			p.serveGetMiss(w, r, repo, sha, file, key)
+			onGetMiss()
 			return
 		}
 		if hsize > 0 {
@@ -343,7 +354,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 			if err != nil {
 				if errors.Is(err, store.ErrNotFound) {
 					// Vanished between Head and GetRange: self-heal.
-					p.serveGetMiss(w, r, repo, sha, file, key)
+					onGetMiss()
 					return
 				}
 				log.Printf("store get range %s: %v", key, err)
@@ -363,7 +374,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 	rc, size, err := p.store.Get(r.Context(), key)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			p.serveGetMiss(w, r, repo, sha, file, key)
+			onGetMiss()
 			return
 		}
 		log.Printf("store get %s: %v", key, err)

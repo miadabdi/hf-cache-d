@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miadabdi/hf-cache-d/internal/local"
 	"github.com/miadabdi/hf-cache-d/internal/manifest"
 	"github.com/miadabdi/hf-cache-d/internal/store"
 )
@@ -59,9 +60,14 @@ type Proxy struct {
 
 	// File-lane state (Task 3).
 	manMu     sync.Mutex
-	manifests map[string]*manifest.Manifest // sha -> read cache
+	manifests map[string]*manifest.Manifest // sha or seal key -> read cache
 	relMu     sync.Mutex
 	releaseMu map[string]*sync.Mutex // sha -> manifest RMW lock
+
+	// Sealed local models (Task 4). nil until SetLocalIndexes wires the
+	// push lane's index cache; reads then check locals BEFORE the public
+	// flow (the shadowing rule).
+	locals *local.Indexes
 }
 
 type refEntry struct {
@@ -133,6 +139,12 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validRev(rev) {
 		p.writeErr(w, http.StatusBadRequest, "invalid revision")
+		return
+	}
+
+	// Sealed local models shadow the public repo for every revision: check
+	// FIRST, and never fall back to the public flow once sealed.
+	if p.handleModelsLocal(w, r, repo, kind, rev) {
 		return
 	}
 

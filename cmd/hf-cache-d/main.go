@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -13,7 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miadabdi/hf-cache-d/internal/local"
 	"github.com/miadabdi/hf-cache-d/internal/proxy"
+	"github.com/miadabdi/hf-cache-d/internal/push"
 	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
@@ -40,7 +43,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           newMux(proxy.New(cfg.HFUpstream, st)),
+		Handler:           newMux(cfg.HFUpstream, cfg.PushToken, st),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -71,22 +74,44 @@ func main() {
 // "/api/models/resolve/x/y") with neither pattern more specific, so
 // co-registering them on one mux panics at startup regardless of order.
 // The file lane therefore lives on a CHILD mux mounted at "/":
-//   - /healthz and /api/models/ (more specific) win on the parent;
+//   - /healthz, /api/models/ and /v1/artifacts/ (more specific) win on the
+//     parent;
 //   - everything else falls through to the file lane, which 404s
 //     non-matching shapes (including /api/models/... never reaches it).
 //
-// /metricsz (Task 5) and the private push lane (Task 4) must mount on the
-// PARENT mux (as literals or subtrees, which always win over "/"); anything
-// left falls to the file lane.
-func newMux(p *proxy.Proxy) *http.ServeMux {
+// /metricsz (Task 5) must also mount on the PARENT mux (as a literal or
+// subtree, which always wins over "/"); anything left falls to the file lane.
+func newMux(upstream, pushToken string, st *store.Store) *http.ServeMux {
+	// *store.Store satisfies muxStore; the indirection exists for the
+	// handler tests' in-memory fake.
+	return newMuxAny(upstream, pushToken, st)
+}
+
+// newMuxAny is newMux over the narrow store interface, so handler tests
+// can pass their in-memory fake while production passes *store.Store.
+func newMuxAny(upstream, pushToken string, st muxStore) *http.ServeMux {
+	// The sealed-local index cache is shared: the proxy reads it (shadowing
+	// rule) and the push lane refreshes it on seal.
+	ix := local.NewIndexes(st)
+	p := proxy.New(upstream, st)
+	p.SetLocalIndexes(ix)
+
+	pl := push.New(pushToken, st, ix)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
 	p.Register(mux) // /api/models/
+	pl.Register(mux) // /v1/artifacts/
 	files := http.NewServeMux()
 	p.RegisterFiles(files)
 	mux.Handle("/", files)
 	mux.HandleFunc("/{$}", handleIndex)
 	return mux
+}
+
+// muxStore is the union of the store slices the lanes consume.
+type muxStore interface {
+	push.Store
+	GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error)
 }
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +133,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		"/api/models/{repo}",
 		"/api/models/{repo}/revision/{rev}",
 		"/api/models/{repo}/tree/{rev}",
+		"/v1/artifacts/{repo} (list, anonymous)",
+		"/v1/artifacts/{repo}/{version}/{file} (PUT, bearer)",
+		"/v1/artifacts/{repo}/{version}/manifest (POST, bearer)",
 		"/{repo}/resolve/{rev}/{file}",
 		"/",
 	}})
