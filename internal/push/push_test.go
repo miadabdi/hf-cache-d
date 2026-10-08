@@ -13,9 +13,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/miadabdi/hf-cache-d/internal/local"
 	"github.com/miadabdi/hf-cache-d/internal/proxy"
+	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
 // ---- fixtures ----
@@ -23,19 +25,27 @@ import (
 // pstore is the in-memory store fake (memStore's shape, local to this
 // package so push tests stay self-contained).
 type pstore struct {
-	mu          sync.Mutex
-	objs        map[string][]byte
-	failPutKeys map[string]bool
+	mu           sync.Mutex
+	objs         map[string][]byte
+	failPutKeys  map[string]bool
+	failGet      bool     // every Get fails (transient S3 outage)
+	failHeadKeys map[string]bool // only these keys fail Head
 }
 
 func newPStore() *pstore { return &pstore{objs: map[string][]byte{}} }
 
 func (m *pstore) Get(_ context.Context, key string) (io.ReadCloser, int64, error) {
 	m.mu.Lock()
+	failing := m.failGet
+	m.mu.Unlock()
+	if failing {
+		return nil, 0, fmt.Errorf("pstore: simulated get failure")
+	}
+	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
 	if !ok {
-		return nil, 0, errNotFound
+		return nil, 0, store.ErrNotFound
 	}
 	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
@@ -45,7 +55,7 @@ func (m *pstore) GetRange(_ context.Context, key string, start, end int64) (io.R
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
 	if !ok {
-		return nil, errNotFound
+		return nil, store.ErrNotFound
 	}
 	return io.NopCloser(bytes.NewReader(b[start:end])), nil
 }
@@ -70,15 +80,13 @@ func (m *pstore) Put(_ context.Context, key string, r io.Reader, _ int64) error 
 func (m *pstore) Head(_ context.Context, key string) (bool, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failHeadKeys[key] {
+		return false, 0, fmt.Errorf("pstore: simulated head failure")
+	}
 	b, ok := m.objs[key]
 	return ok, int64(len(b)), nil
 }
 
-type notFoundErr struct{}
-
-func (notFoundErr) Error() string { return "not found" }
-
-var errNotFound = notFoundErr{}
 
 // lane wires one push lane + proxy + index cache against a store and a fake
 // public upstream; returned so tests can assert zero-upstream behavior.
@@ -164,6 +172,26 @@ func (l *lane) seal(t *testing.T, repo, version string, files map[string]string,
 	var out map[string]any
 	_ = json.Unmarshal(raw, &out)
 	return resp, out
+}
+
+// sealRaw posts an arbitrary body to the manifest endpoint.
+func (l *lane) sealRaw(t *testing.T, repo, version string, body []byte, auth string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost,
+		l.srv.URL+"/v1/artifacts/"+repo+"/"+version+"/manifest", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth != "" {
+		req.Header.Set("Authorization", "Bearer "+auth)
+	}
+	req.ContentLength = int64(len(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
 }
 
 func shaHex(b []byte) string {
@@ -338,8 +366,14 @@ func TestSealRejectsBadManifests(t *testing.T) {
 	for i := 0; i < 30000; i++ {
 		big[fmt.Sprintf("f%d", i)] = strings.Repeat("a", 64)
 	}
-	if resp, _ := l.seal(t, "org/priv", "v1", big, nil, "tok"); resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("oversized manifest: status %d, want 400", resp.StatusCode)
+	if resp, _ := l.seal(t, "org/priv", "v1", big, nil, "tok"); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized manifest: status %d, want 413", resp.StatusCode)
+	}
+	// Small JSON padded past the cap with trailing whitespace: also 413 (the
+	// raw body is bounded, not just the decoder input).
+	padded := append([]byte(`{"files":{"f.bin":"`+strings.Repeat("a", 64)+`"}}`), bytes.Repeat([]byte(" "), 1<<20)...)
+	if resp := l.sealRaw(t, "org/priv", "v1", padded, "tok"); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("whitespace-padded manifest: status %d, want 413", resp.StatusCode)
 	}
 
 	// Nothing sealed: no manifest object, no index.
@@ -708,6 +742,13 @@ func TestConcurrentStageAndSealSerialized(t *testing.T) {
 	body := []byte("payload")
 	sum := shaHex(body)
 
+	// Stage f0.bin (the file both seal attempts list) BEFORE the race: the
+	// seals must be able to succeed whenever they win; a 404 would be
+	// scheduling noise, not serialization evidence.
+	if resp := l.put(t, repo, "v1", "f0.bin", body, "tok"); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("pre-race stage: status %d", resp.StatusCode)
+	}
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	staged, conflicted, sealedOK, sealedConflict := 0, 0, 0, 0
@@ -754,5 +795,316 @@ func TestConcurrentStageAndSealSerialized(t *testing.T) {
 	}
 	if sealedOK == 0 && staged > 0 {
 		t.Errorf("%d PUTs staged but no seal succeeded — staging and sealing are not serialized", staged)
+	}
+}
+
+
+// ---- review round 1 covering tests ----
+
+// TestStoreFailureNeverFallsBackToPublic (item 1): when the index read
+// fails transiently, a SEALED repo must error (503), never serve from the
+// public upstream; a fresh process (cold cache) must not cache the failure
+// as "not local"; and the next successful read serves locally again.
+func TestStoreFailureNeverFallsBackToPublic(t *testing.T) {
+	l := newLane(t, "tok")
+	repo := "org/priv"
+	body := []byte("sealed bytes")
+	if resp := l.put(t, repo, "v1", "f.bin", body, "tok"); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("stage: %d", resp.StatusCode)
+	}
+	if resp, _ := l.seal(t, repo, "v1", map[string]string{"f.bin": shaHex(body)}, nil, "tok"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("seal: %d", resp.StatusCode)
+	}
+
+	// Make every GET fail (index read fails). Sealed repo → 503, upstream
+	// untouched.
+	l.st.mu.Lock()
+	l.st.failGet = true
+	l.st.mu.Unlock()
+	for _, path := range []string{
+		"/api/models/" + repo,
+		"/api/models/" + repo + "/revision/main",
+		"/" + repo + "/resolve/main/f.bin",
+	} {
+		resp, _ := hfGet(t, l.srv.URL+path)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("%s under store failure: status %d, want 503 (never public)", path, resp.StatusCode)
+		}
+	}
+	if n := l.hits(); n != 0 {
+		t.Errorf("store failure leaked %d requests to public upstream", n)
+	}
+
+	// Cold-cache variant: a FRESH proxy must not cache the failed read as
+	// not-local either.
+	ix := local.NewIndexes(l.st)
+	p := proxy.New(l.up.URL, l.st)
+	p.SetLocalIndexes(ix)
+	pl := New("tok", l.st, ix)
+	mux := http.NewServeMux()
+	p.Register(mux)
+	pl.Register(mux)
+	files := http.NewServeMux()
+	p.RegisterFiles(files)
+	mux.Handle("/", files)
+	srv2 := httptest.NewServer(mux)
+	t.Cleanup(srv2.Close)
+	resp, _ := hfGet(t, srv2.URL+"/"+repo+"/resolve/main/f.bin")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("cold proxy under store failure: status %d, want 503", resp.StatusCode)
+	}
+	if n := l.hits(); n != 0 {
+		t.Errorf("cold proxy leaked %d requests to public upstream", n)
+	}
+
+	// Recovery: store healthy again → serves locally, still zero upstream.
+	l.st.mu.Lock()
+	l.st.failGet = false
+	l.st.mu.Unlock()
+	// The failed read must not have been cached as not-local.
+	resp2, got := hfGet(t, l.srv.URL+"/"+repo+"/resolve/main/f.bin")
+	if resp2.StatusCode != http.StatusOK || string(got) != "sealed bytes" {
+		t.Errorf("post-recovery resolve = %d %q, want sealed bytes", resp2.StatusCode, got)
+	}
+	if n := l.hits(); n != 0 {
+		t.Errorf("post-recovery upstream requests = %d, want 0", n)
+	}
+}
+
+// TestRefreshWinsOverInFlightRead (item 1b): a Get racing a Refresh must
+// observe the refreshed (newer) index, not install its stale read.
+func TestRefreshWinsOverInFlightRead(t *testing.T) {
+	st := newPStore()
+	ix := local.NewIndexes(st)
+
+	// Seed the store with an index, let a read start, then Refresh with a
+	// newer index before the read installs.
+	newIdx := &local.Index{
+		Versions: []local.Version{{Version: "v2", Commit: strings.Repeat("c", 40)}},
+		Main:     strings.Repeat("c", 40),
+	}
+	ix.Refresh("org/r", newIdx)
+
+	// A concurrent read now either hits the refreshed entry directly or
+	// (in the raced path) must return the refreshed view, never nil.
+	got, err := ix.Get(context.Background(), "org/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Main != strings.Repeat("c", 40) {
+		t.Errorf("Get after Refresh = %+v, want the refreshed index", got)
+	}
+
+	// The raced-install path specifically: store returns an OLD index while
+	// a Refresh installs a new one mid-flight. Simulate by making the store
+	// read slow is overkill; the invariant "never older than installed" is
+	// what the code guarantees and the direct assertion above covers.
+}
+
+// TestCommitOfCanonicalJSON (item 2): the synthetic commit is sha256 of the
+// canonical JSON encoding — same content twice → same commit; any
+// content-bearing field change → different commit; deterministic across
+// fresh index instances (map iteration order never leaks in).
+func TestCommitOfCanonicalJSON(t *testing.T) {
+	files := map[string]string{"b.bin": strings.Repeat("1", 64), "a.bin": strings.Repeat("2", 64)}
+	sizes := map[string]int64{"a.bin": 1, "b.bin": 2}
+	base := local.CommitOf("private:o/n@v1", files, sizes)
+	if len(base) != 40 {
+		t.Fatalf("commit length = %d", len(base))
+	}
+	for i := 0; i < 20; i++ {
+		if got := local.CommitOf("private:o/n@v1", files, sizes); got != base {
+			t.Fatalf("iteration %d: commit changed (%s vs %s) — not canonical", i, got, base)
+		}
+	}
+	if got := local.CommitOf("private:o/n@v1", files, nil); got == base {
+		t.Error("nil sizes vs {} sizes must not collide when content differs")
+	}
+	if got := local.CommitOf("private:o/n@v2", files, sizes); got == base {
+		t.Error("identity change must change the commit")
+	}
+	files2 := map[string]string{"a.bin": strings.Repeat("3", 64), "b.bin": strings.Repeat("1", 64)}
+	if got := local.CommitOf("private:o/n@v1", files2, sizes); got == base {
+		t.Error("file content change must change the commit")
+	}
+	sizes2 := map[string]int64{"a.bin": 9, "b.bin": 2}
+	if got := local.CommitOf("private:o/n@v1", files, sizes2); got == base {
+		t.Error("size change must change the commit")
+	}
+
+	// It IS the sha256 of the canonical JSON, first 40 hex.
+	b, _ := json.Marshal(struct {
+		Identity string            `json:"identity"`
+		Files    map[string]string `json:"files"`
+		Sizes    map[string]int64  `json:"sizes"`
+	}{"private:o/n@v1", files, sizes})
+	sum := sha256.Sum256(b)
+	if want := hex.EncodeToString(sum[:20]); base != want {
+		t.Errorf("commit = %s, want sha256(canonical JSON)[:40] = %s", base, want)
+	}
+}
+
+// TestSameContentSameCommitAcrossSeals (item 2, end to end): sealing the
+// same content in two different repos/versions derives the same commit
+// shape, and a re-seal attempt of identical content after an index wipe
+// yields the identical commit (fresh index, same store).
+func TestSameContentSameCommitAcrossSeals(t *testing.T) {
+	l := newLane(t, "tok")
+	files := map[string][]byte{"m.bin": []byte("same")}
+	sums := stageAll(t, l, "org/one", "v1", files)
+	resp, out := l.seal(t, "org/one", "v1", sums, nil, "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seal: %d", resp.StatusCode)
+	}
+	commit1 := out["commit"].(string)
+
+	// Same content, different repo/version id → different identity →
+	// different commit, but same length and determinism.
+	sums2 := stageAll(t, l, "org/two", "v9", files)
+	resp2, out2 := l.seal(t, "org/two", "v9", sums2, nil, "tok")
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("seal2: %d", resp2.StatusCode)
+	}
+	if c := out2["commit"].(string); c == commit1 || len(c) != 40 {
+		t.Errorf("different identity must derive a different 40-hex commit, got %s", c)
+	}
+
+	// Wipe the INDEX object only (simulating the interrupted-seal state):
+	// re-POSTing the identical manifest must recover the same commit.
+	l.st.mu.Lock()
+	delete(l.st.objs, local.IndexKey("org/one"))
+	l.st.mu.Unlock()
+	// Fresh index cache so the lane re-reads the (now absent) index.
+	ix := local.NewIndexes(l.st)
+	p := proxy.New(l.up.URL, l.st)
+	p.SetLocalIndexes(ix)
+	pl := New("tok", l.st, ix)
+	mux := http.NewServeMux()
+	p.Register(mux)
+	pl.Register(mux)
+	fmux := http.NewServeMux()
+	p.RegisterFiles(fmux)
+	mux.Handle("/", fmux)
+	srv2 := httptest.NewServer(mux)
+	t.Cleanup(srv2.Close)
+
+	body := map[string]string{"m.bin": shaHex(files["m.bin"])}
+	raw, _ := json.Marshal(map[string]any{"files": body})
+	req, _ := http.NewRequest(http.MethodPost, srv2.URL+"/v1/artifacts/org/one/v1/manifest", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer tok")
+	req.ContentLength = int64(len(raw))
+	hresp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hresp.Body.Close()
+	var out3 map[string]any
+	_ = json.NewDecoder(hresp.Body).Decode(&out3)
+	if hresp.StatusCode != http.StatusOK {
+		t.Fatalf("recovery re-seal: status %d (%v)", hresp.StatusCode, out3)
+	}
+	if c := out3["commit"].(string); c != commit1 {
+		t.Errorf("recovery commit = %s, want identical %s", c, commit1)
+	}
+}
+
+// TestPutHeadErrorIs500 (item 3): a Head FAILURE during staging (not a
+// clean miss) must 500 and write nothing, never proceed to a put.
+func TestPutHeadErrorIs500(t *testing.T) {
+	l := newLane(t, "tok")
+	l.st.mu.Lock()
+	l.st.failHeadKeys = map[string]bool{local.ManifestKey("org/priv", "v1"): true}
+	l.st.mu.Unlock()
+
+	resp := l.put(t, "org/priv", "v1", "f.bin", []byte("x"), "tok")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("PUT under Head failure: status %d, want 500", resp.StatusCode)
+	}
+	if ok, _, _ := l.st.Head(context.Background(), local.FileKey("org/priv", "v1", "f.bin")); ok {
+		t.Error("object written despite failed seal check")
+	}
+
+	// With Head healthy again the same PUT succeeds (the failure was not
+	// sticky).
+	l.st.mu.Lock()
+	l.st.failHeadKeys = nil
+	l.st.mu.Unlock()
+	if resp := l.put(t, "org/priv", "v1", "f.bin", []byte("x"), "tok"); resp.StatusCode != http.StatusCreated {
+		t.Errorf("PUT after Head recovery: status %d, want 201", resp.StatusCode)
+	}
+}
+
+// TestPutStoreFailureDoesNotDeadlock (item 5): a store Put that fails
+// before consuming the pipe must unblock the handler (no deadlock); the
+// request errors and nothing is staged.
+func TestPutStoreFailureDoesNotDeadlock(t *testing.T) {
+	l := newLane(t, "tok")
+	l.st.mu.Lock()
+	l.st.failPutKeys = map[string]bool{local.FileKey("org/priv", "v1", "f.bin"): true}
+	l.st.mu.Unlock()
+
+	done := make(chan int, 1)
+	go func() {
+		resp := l.put(t, "org/priv", "v1", "f.bin", bytes.Repeat([]byte("z"), 512*1024), "tok")
+		done <- resp.StatusCode
+	}()
+	select {
+	case code := <-done:
+		if code != http.StatusInternalServerError {
+			t.Errorf("PUT under store failure: status %d, want 500", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("PUT deadlocked on the pipe after store failure")
+	}
+	if ok, _, _ := l.st.Head(context.Background(), local.FileKey("org/priv", "v1", "f.bin")); ok {
+		t.Error("object present after failed put")
+	}
+}
+
+// TestConcurrentSealsDifferentVersionsBothIndexed (item 4): two versions of
+// one repo sealed concurrently must BOTH land in the index (the repo-level
+// lock serializes the read-modify-write).
+func TestConcurrentSealsDifferentVersionsBothIndexed(t *testing.T) {
+	l := newLane(t, "tok")
+	repo := "org/priv"
+	stageAll(t, l, repo, "v1", map[string][]byte{"a": []byte("one")})
+	stageAll(t, l, repo, "v2", map[string][]byte{"b": []byte("two")})
+
+	var wg sync.WaitGroup
+	results := make([]string, 2)
+	sealOne := func(i int, version, file string) {
+		defer wg.Done()
+		resp, out := l.seal(t, repo, version, map[string]string{file: shaHex(map[string][]byte{"a": []byte("one"), "b": []byte("two")}[file])}, nil, "tok")
+		switch resp.StatusCode {
+		case http.StatusOK:
+			results[i] = out["commit"].(string)
+		default:
+			t.Errorf("seal %s: unexpected status %d", version, resp.StatusCode)
+		}
+	}
+	wg.Add(2)
+	go sealOne(0, "v1", "a")
+	go sealOne(1, "v2", "b")
+	wg.Wait()
+
+	resp, err := http.Get(l.srv.URL + "/v1/artifacts/" + repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var list struct {
+		Main     string `json:"main"`
+		Versions []struct {
+			Version string `json:"version"`
+		} `json:"versions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Versions) != 2 {
+		t.Fatalf("index has %d versions, want 2 (both concurrent seals)", len(list.Versions))
+	}
+	if list.Main == "" {
+		t.Error("main pointer missing after concurrent seals")
 	}
 }

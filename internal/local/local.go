@@ -14,12 +14,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-	"sort"
 	"sync"
 	"time"
+
+	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
 // Version is one sealed version in a repo index.
@@ -76,21 +78,33 @@ func NewIndexes(st storeAPI) *Indexes {
 }
 
 // Get returns the repo's index, or nil when the repo has no sealed versions.
-func (ix *Indexes) Get(ctx context.Context, repo string) *Index {
+// A transient store failure yields an error (NOT a nil index): callers must
+// fail the request rather than fall back to the public flow, and the
+// not-local verdict is never cached from a failed read — the next request
+// retries. A read that raced a concurrent Refresh defers to the installed
+// (newer) view instead of caching its own stale result.
+func (ix *Indexes) Get(ctx context.Context, repo string) (*Index, error) {
 	ix.mu.Lock()
 	if idx, seen := ix.m[repo]; seen {
 		ix.mu.Unlock()
-		return idx
+		return idx, nil
 	}
 	ix.mu.Unlock()
 
-	idx := readIndex(ctx, ix.store, repo)
-	ix.mu.Lock()
-	if _, seen := ix.m[repo]; !seen {
-		ix.m[repo] = idx
+	idx, err := readIndex(ctx, ix.store, repo)
+	if err != nil {
+		return nil, err
 	}
+	ix.mu.Lock()
+	if cur, seen := ix.m[repo]; seen {
+		// A seal refreshed the index while this read was in flight: the
+		// installed view is newer than what we just read.
+		ix.mu.Unlock()
+		return cur, nil
+	}
+	ix.m[repo] = idx
 	ix.mu.Unlock()
-	return idx
+	return idx, nil
 }
 
 // Refresh installs idx as repo's cached index (used by the push lane after
@@ -101,19 +115,28 @@ func (ix *Indexes) Refresh(repo string, idx *Index) {
 	ix.mu.Unlock()
 }
 
-// readIndex loads one repo index; missing/corrupt yields nil.
-func readIndex(ctx context.Context, st storeAPI, repo string) *Index {
+// readIndex loads one repo index. A missing index is (nil, nil) — genuinely
+// not a local model. Any other failure (backend error, corrupt JSON) is an
+// error: treating it as "not local" would let a sealed repo fall through to
+// the public upstream, which the shadowing rule forbids.
+func readIndex(ctx context.Context, st storeAPI, repo string) (*Index, error) {
 	rc, _, err := st.Get(ctx, IndexKey(repo))
 	if err != nil {
-		return nil
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("local index read %s: %w", repo, err)
 	}
 	defer rc.Close()
 	var idx Index
-	if err := json.NewDecoder(rc).Decode(&idx); err != nil || len(idx.Versions) == 0 {
-		log.Printf("local index for %s not valid, treating as absent", repo)
-		return nil
+	if err := json.NewDecoder(rc).Decode(&idx); err != nil {
+		log.Printf("local index for %s not valid: %v", repo, err)
+		return nil, fmt.Errorf("local index %s is corrupt", repo)
 	}
-	return &idx
+	if len(idx.Versions) == 0 {
+		return nil, nil
+	}
+	return &idx, nil
 }
 
 // Lookup maps rev to a sealed version of repo.
@@ -142,26 +165,26 @@ func (idx *Index) Lookup(rev string) (Version, bool) {
 	return Version{}, false
 }
 
-// CommitOf derives the synthetic 40-hex commit from the seal content:
-// sha256 over the canonical JSON of identity+files+sizes (files and sizes
-// sorted by path), first 40 hex chars. Deterministic across restarts and
-// re-seals of identical content, so clients can pin it safely.
+// CommitOf derives the synthetic 40-hex commit: sha256 over the canonical
+// JSON encoding of the manifest's content-bearing fields (identity, files,
+// sizes), first 40 hex chars. encoding/json emits struct fields in
+// declaration order and map keys sorted, so the encoding is canonical —
+// identical content yields identical commits across restarts and re-seals.
+// PulledAt is deliberately excluded (it changes per seal).
 func CommitOf(identity string, files map[string]string, sizes map[string]int64) string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\n", identity)
-	for _, f := range sortedKeys(files) {
-		fmt.Fprintf(h, "%s %s %d\n", f, files[f], sizes[f])
+	if sizes == nil {
+		sizes = map[string]int64{} // canonical: {} not null
 	}
-	sum := h.Sum(nil)
+	b, err := json.Marshal(struct {
+		Identity string            `json:"identity"`
+		Files    map[string]string `json:"files"`
+		Sizes    map[string]int64  `json:"sizes"`
+	}{identity, files, sizes})
+	if err != nil {
+		// These value types cannot fail to marshal; sha of nothing keeps the
+		// function total.
+		b = nil
+	}
+	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:20])
-}
-
-// sortedKeys returns files' keys sorted (map iteration order is random).
-func sortedKeys(m map[string]string) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return ks
 }

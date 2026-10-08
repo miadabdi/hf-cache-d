@@ -51,11 +51,21 @@ type Lane struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // "org/name@version" -> staging/seal lock
 	// ponytail: unbounded lock map, evict when repo count grows.
+
+	idxMu    sync.Mutex
+	repoLock map[string]*sync.Mutex // "org/name" -> index read-modify-write lock
+	// ponytail: unbounded lock map, evict when repo count grows.
 }
 
 // New builds the push lane. Empty token disables PUT/POST (404).
 func New(token string, st Store, ix *local.Indexes) *Lane {
-	return &Lane{token: token, store: st, index: ix, locks: map[string]*sync.Mutex{}}
+	return &Lane{
+		token:    token,
+		store:    st,
+		index:    ix,
+		locks:    map[string]*sync.Mutex{},
+		repoLock: map[string]*sync.Mutex{},
+	}
 }
 
 // Register mounts the push routes on mux (the parent mux; /v1/artifacts/ is
@@ -136,7 +146,13 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 	mu.Lock()
 	defer mu.Unlock()
 
-	if sealed, _ := l.isSealed(r.Context(), repo, version); sealed {
+	sealed, err := l.isSealed(r.Context(), repo, version)
+	if err != nil {
+		log.Printf("push head %s: %v", local.ManifestKey(repo, version), err)
+		writeErr(w, http.StatusInternalServerError, "store read failed")
+		return
+	}
+	if sealed {
 		writeErr(w, http.StatusConflict, "version is sealed and immutable")
 		return
 	}
@@ -145,11 +161,19 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 	// Stream body → hash + S3 through a pipe: the SDK's single-shot Put
 	// needs a seekable body (payload checksum), but the request body is not
 	// seekable, so use the multipart streaming path like the file lane's
-	// tee-through upload.
+	// tee-through upload. The store goroutine closes the pipe reader on ALL
+	// exits so a Put failure before consuming the body cannot deadlock the
+	// handler's writes.
 	pr, pw := io.Pipe()
 	hash := sha256.New()
 	putDone := make(chan error, 1)
-	go func() { putDone <- l.store.Put(r.Context(), key, pr, -1) }()
+	go func() {
+		err := l.store.Put(r.Context(), key, pr, -1)
+		if err != nil {
+			pr.CloseWithError(err)
+		}
+		putDone <- err
+	}()
 	if _, err := io.Copy(io.MultiWriter(pw, hash), io.LimitReader(r.Body, r.ContentLength)); err != nil {
 		pw.CloseWithError(err)
 		<-putDone
@@ -188,13 +212,23 @@ type sealReq struct {
 // write leaves a "sealed but unindexed" state; re-POST repairs it via
 // recovery: the index gains the version if it is missing, and 200s.
 func (l *Lane) handleSeal(w http.ResponseWriter, r *http.Request, repo, version, vkey string) {
+	// Bound the RAW body, not just the decoder input: a small JSON document
+	// followed by megabytes of trailing whitespace must not slip through.
 	var req sealReq
-	dec := json.NewDecoder(io.LimitReader(r.Body, manifestMaxBytes+1))
-	if err := dec.Decode(&req); err != nil {
+	body, err := io.ReadAll(io.LimitReader(r.Body, manifestMaxBytes+1))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "manifest body unreadable")
+		return
+	}
+	if len(body) > manifestMaxBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "manifest body exceeds 1MiB")
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "manifest body must be JSON {files:{path:sha256},sizes:{path:n}}")
 		return
 	}
-	if dec.More() || len(req.Files) == 0 {
+	if len(req.Files) == 0 {
 		writeErr(w, http.StatusBadRequest, "manifest must list at least one file")
 		return
 	}
@@ -203,7 +237,12 @@ func (l *Lane) handleSeal(w http.ResponseWriter, r *http.Request, repo, version,
 	mu.Lock()
 	defer mu.Unlock()
 
-	idx := l.index.Get(r.Context(), repo)
+	idx, err := l.index.Get(r.Context(), repo)
+	if err != nil {
+		log.Printf("local index for %s: %v", repo, err)
+		writeErr(w, http.StatusInternalServerError, "index read failed")
+		return
+	}
 	if idx != nil {
 		if v, ok := idx.Lookup(version); ok && v.Commit != "" {
 			writeJSON(w, http.StatusConflict, map[string]string{
@@ -290,8 +329,10 @@ func (l *Lane) handleSeal(w http.ResponseWriter, r *http.Request, repo, version,
 		}
 	}
 
-	// Index update: append + move main. A failure here is reported (500),
-	// never claimed complete; recovery is re-POST (see above).
+	// Index update: append + move main, serialized repo-wide so concurrent
+	// seals of different versions cannot lose each other's entries. A
+	// failure here is reported (500), never claimed complete; recovery is
+	// re-POST (see above).
 	next, err := l.updatedIndex(r.Context(), repo, version, commit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "sealed but index update failed; re-post manifest to recover")
@@ -327,12 +368,14 @@ func (l *Lane) isSealed(ctx context.Context, repo, version string) (bool, error)
 
 // updatedIndex loads the repo index from the store, appends the newly sealed
 // version (ordered by seal time, main = latest), writes it back and returns
-// it. The caller holds the version lock; concurrent seals of DIFFERENT
-// versions in one repo can interleave read-modify-write — the single-process
-// plan accepts this (worst case: a seal lost from the index, repairable by
-// re-POST recovery).
-// ponytail: per-repo lock would close the cross-version window.
+// it. The repo-level index lock serializes the read-modify-write across
+// versions: two seals of different versions in one repo cannot interleave
+// and lose an entry. The caller separately holds the version lock.
 func (l *Lane) updatedIndex(ctx context.Context, repo, version, commit string) (*local.Index, error) {
+	mu := l.muForRepo(repo)
+	mu.Lock()
+	defer mu.Unlock()
+
 	idx := readStoreIndex(ctx, l.store, repo)
 	if idx == nil {
 		idx = &local.Index{}
@@ -385,7 +428,12 @@ func readStoreIndex(ctx context.Context, st Store, repo string) *local.Index {
 
 // handleList serves the anonymous version listing.
 func (l *Lane) handleList(w http.ResponseWriter, r *http.Request, repo string) {
-	idx := l.index.Get(r.Context(), repo)
+	idx, err := l.index.Get(r.Context(), repo)
+	if err != nil {
+		log.Printf("local index for %s: %v", repo, err)
+		writeErr(w, http.StatusInternalServerError, "index read failed")
+		return
+	}
 	if idx == nil {
 		writeErr(w, http.StatusNotFound, "unknown repo")
 		return
@@ -422,6 +470,18 @@ func (l *Lane) muFor(vkey string) *sync.Mutex {
 	}
 	mu := &sync.Mutex{}
 	l.locks[vkey] = mu
+	return mu
+}
+
+// muForRepo returns the per-repo index read-modify-write lock.
+func (l *Lane) muForRepo(repo string) *sync.Mutex {
+	l.idxMu.Lock()
+	defer l.idxMu.Unlock()
+	if mu, ok := l.repoLock[repo]; ok {
+		return mu
+	}
+	mu := &sync.Mutex{}
+	l.repoLock[repo] = mu
 	return mu
 }
 
