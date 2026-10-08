@@ -26,6 +26,9 @@ func testEndpoint() string {
 	if e := os.Getenv("S3_TEST_ENDPOINT"); e != "" {
 		return e
 	}
+	if p := os.Getenv("SEAWEEDFS_S3_PORT"); p != "" {
+		return "http://localhost:" + p
+	}
 	return "http://localhost:8333"
 }
 
@@ -55,7 +58,11 @@ func newTestStore(t *testing.T) *Store {
 	}
 	conn, err := net.DialTimeout("tcp", hostport, 2*time.Second)
 	if err != nil {
-		t.Skipf("S3 endpoint %s not reachable (start with: docker compose up -d && ./scripts/dev-s3.sh): %v", endpoint, err)
+		msg := fmt.Sprintf("S3 endpoint %s not reachable (start with: docker compose up -d && ./scripts/dev-s3.sh): %v", endpoint, err)
+		if os.Getenv("S3_TEST_STRICT") == "1" {
+			t.Fatal(msg)
+		}
+		t.Skip(msg)
 	}
 	conn.Close()
 
@@ -69,7 +76,11 @@ func newTestStore(t *testing.T) *Store {
 	// endpoint is not OUR fixture; skip with instructions instead of
 	// producing a confusing failure.
 	if _, _, err := st.Get(context.Background(), prefix()+"auth-probe"); err != nil && !errors.Is(err, ErrNotFound) {
-		t.Skipf("S3 endpoint %s reachable but not usable with fixture creds (expected when another SeaweedFS owns the port; fix with: docker compose down && SEAWEEDFS_S3_PORT=8333 docker compose up -d && ./scripts/dev-s3.sh): %v", endpoint, err)
+		msg := fmt.Sprintf("S3 endpoint %s reachable but not usable with fixture creds (fix with: docker compose down && docker compose up -d && ./scripts/dev-s3.sh): %v", endpoint, err)
+		if os.Getenv("S3_TEST_STRICT") == "1" {
+			t.Fatal(msg)
+		}
+		t.Skip(msg)
 	}
 	return st
 }

@@ -60,7 +60,10 @@ fi
 # auth (verified on 4.48: without this the gateway accepts ANY SigV4 key).
 # s3.configure is idempotent: re-running it rewrites the same key pair.
 echo "ensuring S3 credentials are registered ..."
-docker compose -f "$COMPOSE_FILE" exec -T seaweedfs sh -c "printf 's3.configure -access_key %s -secret_key %s -user admin -actions Admin,Read,Write -apply\n' '${ACCESS_KEY}' '${SECRET_KEY}' | weed shell -master ${MASTER}" >/dev/null
+# The secret only travels through stdin: never argv or the script's output.
+printf 's3.configure -access_key %s -secret_key %s -user admin -actions Admin,Read,Write -apply\n' "$ACCESS_KEY" "$SECRET_KEY" |
+  docker compose -f "$COMPOSE_FILE" exec -T seaweedfs weed shell -master "$MASTER" >/dev/null
 
-echo "creds in use: access key '${ACCESS_KEY}', secret '${SECRET_KEY}' (local throwaway values)."
+# The signed Go integration probe (S3_TEST_STRICT=1 in CI) validates that
+# registered credentials actually work with the SDK, not just weed shell.
 echo "done: S3 ready at ${S3_ENDPOINT}, bucket ${BUCKET}."
