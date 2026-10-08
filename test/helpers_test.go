@@ -249,7 +249,7 @@ func barrier(t *testing.T, st *store.Store, sha, repo string, files map[string][
 	for name, sum := range sums {
 		ok := false
 		for time.Now().Before(deadline) {
-			rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/%s/manifest.json", sha[:2], sha, repo))
+			rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/%s/@manifest", sha[:2], sha, repo))
 			if err == nil {
 				var m struct {
 					Files map[string]string `json:"files"`

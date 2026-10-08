@@ -28,7 +28,7 @@ func manifestKey(sha string) string {
 }
 
 func manifestKeyFor(repo, sha string) string {
-	return fmt.Sprintf("pub/%s/%s/%s/manifest.json", sha[:2], sha, repo)
+	return fmt.Sprintf("pub/%s/%s/%s/@manifest", sha[:2], sha, repo)
 }
 
 // addFile installs a file in the fake upstream and returns its sha256 hex.
@@ -803,6 +803,38 @@ func TestVanishedObjectSelfHeals(t *testing.T) {
 	}
 	if et := resp4.Header.Get("ETag"); et == `"`+sum+`"` {
 		t.Errorf("vanished ranged GET retained stale sealed ETag %q", et)
+	}
+}
+
+func TestManifestJSONFileDoesNotCollideWithReleaseManifest(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := []byte("real upstream manifest.json file")
+	sum := addFile(t, f, "manifest.json", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+	url := srv.URL + "/org/name/resolve/main/manifest.json"
+	if resp, got := proxyGet(t, url, nil); resp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
+		t.Fatalf("cold GET: %d %q", resp.StatusCode, got)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return st.has("pub/aa/" + sha1 + "/org/name/@manifest")
+	}, "sentinel release manifest")
+	if files := readFileManifest(t, st, sha1); files["manifest.json"] != sum {
+		t.Fatalf("sentinel manifest missing correct file entry: %v", files)
+	}
+	rc, _, err := st.Get(context.Background(), fileKey(sha1, "org/name", "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(stored, body) {
+		t.Fatalf("stored file overwritten: %q", stored)
+	}
+	if resp, got := proxyGet(t, url, nil); resp.Header.Get("X-Cache") != "HIT" || !bytes.Equal(got, body) {
+		t.Fatalf("warm GET: cache %q bytes %q", resp.Header.Get("X-Cache"), got)
 	}
 }
 

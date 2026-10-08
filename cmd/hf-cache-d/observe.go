@@ -176,11 +176,14 @@ func checkOneManifest(ctx context.Context, st integrityStore, logger *log.Logger
 	}
 
 	// Object keys derive from the manifest's own key and identity:
-	//   public pull: pub/<xx>/<sha>/<repo>/manifest.json + "hf:<repo>@<sha>"
+	//   public pull: pub/<xx>/<sha>/<repo>/@manifest + "hf:<repo>@<sha>"
 	//     → pub/<xx>/<sha>/<repo>/<file>
 	//   seal:        priv/<org>/<name>/<version>/manifest.json
 	//     + "private:<repo>@<version>" → priv/<org>/<name>/<version>/files/<file>
-	prefix := strings.TrimSuffix(strings.TrimSuffix(key, "manifest.json"), "/")
+	prefix := strings.TrimSuffix(strings.TrimSuffix(key, "@manifest"), "/")
+	if strings.HasPrefix(key, "priv/") {
+		prefix = strings.TrimSuffix(strings.TrimSuffix(key, "manifest.json"), "/")
+	}
 	private := strings.HasPrefix(m.Identity, "private:")
 	_, ok := identityRepo(m.Identity)
 	if !ok && !private {

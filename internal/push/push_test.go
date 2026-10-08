@@ -578,15 +578,31 @@ func TestSealCorruptManifestDoesNotOverwrite(t *testing.T) {
 	}
 }
 
-func TestFailedStageInventoryCannotLeaveUntrackedFile(t *testing.T) {
+func TestFailedBodyUploadLeavesNoGhostStagedPath(t *testing.T) {
+	l := newLane(t, "tok")
+	repo, version := "org/priv", "v1"
+	a := stageAll(t, l, repo, version, map[string][]byte{"a": []byte("one")})
+	l.st.mu.Lock()
+	l.st.failPutKeys = map[string]bool{local.FileKey(repo, version, "b"): true}
+	l.st.mu.Unlock()
+	if resp := l.put(t, repo, version, "b", []byte("two"), "tok"); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("failed body upload: status %d, want 500", resp.StatusCode)
+	}
+	if resp, out := l.seal(t, repo, version, a, nil, "tok"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed PUT left ghost staging path: seal status %d (%v)", resp.StatusCode, out)
+	}
+}
+
+func TestFailedStageInventoryNeverRegistersPath(t *testing.T) {
 	l := newLane(t, "tok")
 	repo, version := "org/priv", "v1"
 	l.st.failPutKeys = map[string]bool{stageListKey(repo, version): true}
 	if resp := l.put(t, repo, version, "b", []byte("two"), "tok"); resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("inventory write failure: %d", resp.StatusCode)
 	}
-	if exists, _, _ := l.st.Head(context.Background(), local.FileKey(repo, version, "b")); exists {
-		t.Fatal("body uploaded despite failed inventory registration")
+	staged, err := l.pl.readStageList(context.Background(), stageListKey(repo, version))
+	if err != nil || staged.Files["b"] {
+		t.Fatalf("failed inventory registration recorded a successful path: %+v, %v", staged, err)
 	}
 }
 

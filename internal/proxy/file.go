@@ -53,7 +53,7 @@ func (p *Proxy) RegisterFiles(mux *http.ServeMux) {
 // S3 key layout (documented contract):
 //
 //	pub/<sha[0:2]>/<sha>/<repo>/<file>   file body
-//	pub/<sha[0:2]>/<sha>/<repo>/manifest.json   release manifest (Files: path → sha256)
+//	pub/<sha[0:2]>/<sha>/<repo>/@manifest   release manifest (Files: path → sha256)
 //
 // A file counts as cached only when its manifest entry exists: an S3 object
 // without a manifest entry is a partial or aborted upload and is never
@@ -113,7 +113,7 @@ func fileKeyOf(sha, repo, file string) string {
 
 // manifestKeyOf builds the repo-scoped manifest and cache identity.
 func manifestKeyOf(repo, sha string) string {
-	return fmt.Sprintf("pub/%s/%s/%s/manifest.json", sha[:2], sha, repo)
+	return fmt.Sprintf("pub/%s/%s/%s/@manifest", sha[:2], sha, repo)
 }
 
 // validFilePath enforces the file-lane shape: [A-Za-z0-9._/-]+, no "..", no

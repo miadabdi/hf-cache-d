@@ -165,23 +165,6 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 		return
 	}
 
-	// Record the path BEFORE uploading: an inventory write failure must
-	// never leave an untracked object that a seal could silently omit.
-	stageKey := stageListKey(repo, version)
-	staged, err := l.readStageList(r.Context(), stageKey)
-	if err != nil {
-		log.Printf("push stage list %s: %v", stageKey, err)
-		writeErr(w, http.StatusInternalServerError, "stage list read failed")
-		return
-	}
-	staged.Files[file] = true
-	stageBody, _ := json.Marshal(staged)
-	if err := l.store.Put(r.Context(), stageKey, strings.NewReader(string(stageBody)), int64(len(stageBody))); err != nil {
-		log.Printf("push stage list put %s: %v", stageKey, err)
-		writeErr(w, http.StatusInternalServerError, "stage list write failed")
-		return
-	}
-
 	key := local.FileKey(repo, version, file)
 	// Stream body → hash + S3 through a pipe: the SDK's single-shot Put
 	// needs a seekable body (payload checksum), but the request body is not
@@ -216,6 +199,22 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 	if n, _ := io.Copy(io.Discard, r.Body); n > 0 {
 		// Extra bytes beyond Content-Length: refuse rather than silently drop.
 		writeErr(w, http.StatusBadRequest, "body longer than content-length")
+		return
+	}
+	// Register only successful uploads. An inventory write failure returns
+	// 500; the body is unreferenced and cannot be sealed as a completed PUT.
+	stageKey := stageListKey(repo, version)
+	staged, err := l.readStageList(r.Context(), stageKey)
+	if err != nil {
+		log.Printf("push stage list %s: %v", stageKey, err)
+		writeErr(w, http.StatusInternalServerError, "stage list read failed")
+		return
+	}
+	staged.Files[file] = true
+	stageBody, _ := json.Marshal(staged)
+	if err := l.store.Put(r.Context(), stageKey, strings.NewReader(string(stageBody)), int64(len(stageBody))); err != nil {
+		log.Printf("push stage list put %s: %v", stageKey, err)
+		writeErr(w, http.StatusInternalServerError, "stage list write failed")
 		return
 	}
 	sum := hex.EncodeToString(hash.Sum(nil))

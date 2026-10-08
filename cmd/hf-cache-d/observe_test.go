@@ -104,7 +104,7 @@ func TestVanishedSealedObjectDoesNotLogHit(t *testing.T) {
 func putManifest(t *testing.T, st *memStore, sha string, files map[string]string) {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"identity": "hf:org/name@" + sha, "files": files})
-	if err := st.Put(context.Background(), fmt.Sprintf("pub/%s/%s/org/name/manifest.json", sha[:2], sha), bytes.NewReader(body), int64(len(body))); err != nil {
+	if err := st.Put(context.Background(), fmt.Sprintf("pub/%s/%s/org/name/@manifest", sha[:2], sha), bytes.NewReader(body), int64(len(body))); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -188,7 +188,7 @@ func TestIntegrityCheckCriticalOnCorruption(t *testing.T) {
 	logger := log.New(&buf, "", 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/org/name/manifest.json", goodSHA[:2], goodSHA)}}, logger, 50*time.Millisecond)
+	go runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/org/name/@manifest", goodSHA[:2], goodSHA)}}, logger, 50*time.Millisecond)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for !strings.Contains(buf.String(), "CRITICAL: integrity mismatch") && time.Now().Before(deadline) {
@@ -242,7 +242,7 @@ func TestIntegrityCheckCleanPassNoOutput(t *testing.T) {
 
 	var buf syncBuffer
 	logger := log.New(&buf, "", 0)
-	if err := checkOneManifest(context.Background(), st, logger, fmt.Sprintf("pub/%s/%s/org/name/manifest.json", goodSHA[:2], goodSHA)); err != nil {
+	if err := checkOneManifest(context.Background(), st, logger, fmt.Sprintf("pub/%s/%s/org/name/@manifest", goodSHA[:2], goodSHA)); err != nil {
 		t.Fatalf("checkOneManifest: %v", err)
 	}
 	if buf.Len() != 0 {
@@ -260,7 +260,7 @@ func TestIntegrityCheckJoinsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/org/name/manifest.json", goodSHA[:2], goodSHA)}}, logger, 20*time.Millisecond)
+		runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/org/name/@manifest", goodSHA[:2], goodSHA)}}, logger, 20*time.Millisecond)
 		close(done)
 	}()
 	// Let at least one tick+pass run, then cancel.

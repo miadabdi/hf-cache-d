@@ -105,7 +105,7 @@ Exactly these routes are implemented (everything else 404s):
 | `PUT /v1/artifacts/{org}/{name}/{version}/{file}` | Stage a file (bearer token; `Content-Length` required). Returns `{file, sha256, size}`. |
 | `POST /v1/artifacts/{org}/{name}/{version}/manifest` | Seal the version (bearer). Body `{"files":{path:sha256}}`; the exact staged file set is required and bytes are re-hashed server-side. Returns the synthetic `{version, commit}`. |
 
-Public file manifests live at `pub/<sha-prefix>/<sha>/<org>/<name>/manifest.json`
+Public file manifests live at `pub/<sha-prefix>/<sha>/<org>/<name>/@manifest`
 (repo-scoped, so forks may share a SHA); staged paths live at
 `priv/<org>/<name>/<version>/stage.json` and are marked sealed on success.
 Metadata bodies and encoded cached envelopes are capped at 32 MiB each;
