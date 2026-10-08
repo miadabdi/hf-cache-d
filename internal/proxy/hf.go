@@ -56,6 +56,10 @@ type Proxy struct {
 	// ponytail: unbounded transfer time is the trusted-network ceiling; add
 	// a deadline/semaphore if exposed to untrusted networks.
 	fileClient *http.Client
+	// headClient HEADs the resolve URL WITHOUT following the CDN redirect,
+	// so headers come from HF's own hop (X-Linked-ETag sha256), not the
+	// CDN's CAS ETag. See New for the why.
+	headClient *http.Client
 	now        func() time.Time
 
 	mu   sync.Mutex
@@ -91,11 +95,21 @@ func New(upstream string, st storeAPI) *Proxy {
 		store:      st,
 		client:     &http.Client{Timeout: 60 * time.Second},
 		fileClient: &http.Client{},
-		now:        time.Now,
-		refs:       map[string]refEntry{},
-		manifests:  map[string]*manifest.Manifest{},
-		releaseMu:  map[string]*sync.Mutex{},
-		m:          metrics.Default,
+		// headClient stops at HF's 302 resolve hop: the pre-redirect response
+		// carries X-Linked-ETag/X-Linked-Size (the sha256 truth), while the
+		// CDN hop's own ETag is a CAS-style hash for xet-backed files that
+		// would flip against our warm sha256 ETags.
+		headClient: &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Timeout: 60 * time.Second,
+		},
+		now:       time.Now,
+		refs:      map[string]refEntry{},
+		manifests: map[string]*manifest.Manifest{},
+		releaseMu: map[string]*sync.Mutex{},
+		m:         metrics.Default,
 	}
 }
 
@@ -186,10 +200,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 // fetch (HF ignores unknown params), so arbitrary input cannot mint
 // unbounded permanent S3 keys.
 var allowedParams = map[string]bool{
-	"recursive": true,
-	"cursor":    true,
-	"expand":    true,
-	"limit":     true,
+	"recursive":      true,
+	"cursor":         true,
+	"expand":         true,
+	"limit":          true,
+	"files_metadata": true, // sibling size info: callers verify sizes for adoption/corruption checks
 }
 
 // allowQuery canonicalizes allowlisted values. Duplicate occurrences keep

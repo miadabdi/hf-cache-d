@@ -46,6 +46,7 @@ type fakeUpstream struct {
 	files    map[string][]byte // repo-relative path -> body served for repo@main
 	truncate int               // >0: serve only the first N bytes then hang up
 	slow     int               // >0: CDN ms sleep per 8KiB chunk (disconnect tests)
+	xetMode  bool              // CDN hop carries only its CAS ETag (no X-Linked-ETag), like xet-backed LFS
 	cdnSeen  map[string]int    // fake-CDN request counts by path (not query)
 	cdn      *httptest.Server
 }
@@ -59,15 +60,21 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 		// Path shape: /{repo}/resolve/{rev}/{file...}
 		rest, _ := strings.CutPrefix(strings.TrimPrefix(r.URL.Path, "/"+f.repo+"/"), "resolve/")
 		_, fname, _ := strings.Cut(rest, "/")
-		file, truncate, slow := f.files[fname], f.truncate, f.slow
+		file, truncate, slow, xet := f.files[fname], f.truncate, f.slow, f.xetMode
 		f.mu.Unlock()
 		if file == nil {
 			http.NotFound(w, r)
 			return
 		}
 		etag := fmt.Sprintf(`"%s"`, fakeETag(file))
-		w.Header().Set("X-Linked-ETag", etag)
-		w.Header().Set("X-Linked-Size", fmt.Sprint(len(file)))
+		if xet {
+			// xet-backed LFS: the CDN hop knows only its own CAS hash —
+			// deliberately NOT the file sha256 — and no X-Linked-* headers.
+			w.Header().Set("ETag", `"cas-`+fakeETag(file)+`"`)
+		} else {
+			w.Header().Set("X-Linked-ETag", etag)
+			w.Header().Set("X-Linked-Size", fmt.Sprint(len(file)))
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		if r.Method == http.MethodHead {
 			w.WriteHeader(200)
@@ -154,11 +161,23 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 		}
 		// File lane: /{repo}/resolve/{rev}/{file} → 302 to the fake CDN,
 		// mirroring how HF hands files to its CDN. The hub server never
-		// serves file bodies itself.
+		// serves file bodies itself. Like real HF on xet/LFS files, the
+		// pre-redirect hop stamps X-Linked-ETag (the sha256), while the CDN
+		// hop's own ETag is a different CAS-style hash: a HEAD that follows
+		// the redirect and reads only the final hop would flip ETags once
+		// the mirror warms.
 		if _, ok := strings.CutPrefix(r.URL.Path, "/"+repo+"/resolve/"); ok {
 			if f.files == nil || len(f.files) == 0 {
 				w.WriteHeader(http.StatusNotFound)
 				return
+			}
+			rest := strings.TrimPrefix(r.URL.Path, "/"+repo+"/resolve/")
+			if fname, _, ok := strings.Cut(strings.TrimPrefix(rest, main+"/"), "/"); ok || rest != "" {
+				if body, ok := f.files[fname]; ok {
+					sum := sha256.Sum256(body)
+					w.Header().Set("X-Linked-ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+					w.Header().Set("X-Linked-Size", fmt.Sprint(len(body)))
+				}
 			}
 			w.Header().Set("Location", f.cdn.URL+r.URL.Path)
 			w.WriteHeader(http.StatusFound)
@@ -722,6 +741,25 @@ func TestQueryAllowlistKeysAndFetch(t *testing.T) {
 	resp3, _ := proxyGet(t, srv.URL+"/api/models/org/name/tree/main?recursive=true&limit=5", nil)
 	if resp3.Header.Get("X-Cache") != "HIT" {
 		t.Errorf("reordered params X-Cache = %q, want HIT (canonical key is sorted)", resp3.Header.Get("X-Cache"))
+	}
+}
+
+// TestFilesMetadataParamForwarded pins the files_metadata allowlist: the
+// param must reach upstream so sibling entries carry sizes (try_adopt
+// size-diff verification depends on them).
+func TestFilesMetadataParamForwarded(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	resp, _ := proxyGet(t, srv.URL+"/api/models/org/name?files_metadata=true", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if n := f.count("/api/models/org/name/revision/" + sha1 + "?files_metadata=true"); n != 1 {
+		t.Errorf("pinned fetches with files_metadata = %d, want 1 (param must be forwarded)", n)
 	}
 }
 

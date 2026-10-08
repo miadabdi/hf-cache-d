@@ -136,6 +136,89 @@ func TestHeadMissThenHit(t *testing.T) {
 	}
 }
 
+// TestColdHeadETagStableAcrossWarm pins the xet/LFS ETag contract: the cold
+// HEAD must adopt the PRE-REDIRECT hop's X-Linked-ETag (HF's sha256), not
+// the CDN hop's CAS-style ETag — otherwise a client doing
+// hf_hub_download(repo, file, revision="main") on a persistent local_dir
+// re-downloads the file once after the mirror warms (cold ETag ≠ warm ETag).
+func TestColdHeadETagStableAcrossWarm(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.xetMode = true // CDN hop carries only its CAS ETag, like xet-backed LFS
+	body := []byte("etag flip bait")
+	sum := addFile(t, f, "flip.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// Warm the cache with a GET so the warm HEAD serves sha256.
+	if _, got := proxyGet(t, srv.URL+"/org/name/resolve/main/flip.bin", nil); !bytes.Equal(got, body) {
+		t.Fatal("cold GET body mismatch")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files["flip.bin"] == sum
+	}, "manifest entry for flip.bin")
+
+	// Cold-HEAD ETag must equal warm-HEAD ETag: both are the manifest sha256
+	// (the pre-redirect X-Linked-ETag), never the CDN CAS hash.
+	head := func() string {
+		req, _ := http.NewRequest(http.MethodHead, srv.URL+"/org/name/resolve/main/flip.bin", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.Header.Get("ETag")
+	}
+	warmEtag := head() // warm: HIT path, sha256-based
+	f.mu.Lock()
+	f.cdnSeen = map[string]int{}
+	f.mu.Unlock()
+	if warmEtag != `"`+sum+`"` {
+		t.Fatalf("warm HEAD ETag = %q, want sha256 %q", warmEtag, sum)
+	}
+
+	// The cold probe: a fresh proxy over the same store has an empty
+	// in-memory manifest cache BUT loads the manifest from the store — so its
+	// HEAD would also HIT. The genuinely cold case (no manifest anywhere) is
+	// a file not yet GET-cached. Assert the contract directly on a second
+	// file: cold HEAD (MISS) ETag must equal what the warm HEAD will serve
+	// after a GET caches it — both the sha256, never the CDN CAS hash.
+	addFile(t, f, "flip2.bin", body)
+	srv2head := func() (etag, cache string) {
+		req, _ := http.NewRequest(http.MethodHead, srv.URL+"/org/name/resolve/main/flip2.bin", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.Header.Get("ETag"), resp.Header.Get("X-Cache")
+	}
+	sum2 := sum // flip2.bin has the same body as flip.bin
+	coldEtag, cacheState := srv2head()
+	if cacheState != "MISS" {
+		t.Fatalf("flip2 first HEAD X-Cache = %q, want MISS (cold probe must be cold)", cacheState)
+	}
+	if coldEtag == "" {
+		t.Fatal("cold HEAD ETag empty")
+	}
+	if coldEtag != `"`+sum2+`"` {
+		t.Errorf("cold HEAD ETag = %q, want sha256 %q (pre-redirect X-Linked-ETag, not CDN CAS)", coldEtag, sum2)
+	}
+	// After caching, the warm ETag matches the cold one.
+	proxyGet(t, srv.URL+"/org/name/resolve/main/flip2.bin", nil)
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files["flip2.bin"] == sum2
+	}, "manifest entry for flip2.bin")
+	warmEtag2, _ := srv2head()
+	if warmEtag2 != coldEtag {
+		t.Errorf("ETag flips across warm: cold=%q warm=%q — cold HEAD adopted the CDN CAS ETag instead of the pre-redirect X-Linked-ETag", coldEtag, warmEtag2)
+	}
+	_ = warmEtag
+}
+
 // TestGetColdStreamsThenWarmHit covers the core GET path: cold stream tee'd
 // to store+client, warm byte-identical with zero upstream file traffic, and
 // the manifest entry published under the resolved commit.
@@ -766,8 +849,12 @@ func TestVanishedObjectSelfHeals(t *testing.T) {
 	if got := resp.Header.Get("Content-Length"); got != fmt.Sprint(len(body)) {
 		t.Errorf("vanished-object HEAD Content-Length = %q, want %d (upstream truth)", got, len(body))
 	}
-	if got := resp.Header.Get("ETag"); got == `"`+sum+`"` {
-		t.Errorf("vanished-object HEAD kept stale sealed ETag %q", got)
+	if got := resp.Header.Get("ETag"); got == "" {
+		t.Error("vanished-object HEAD lost ETag entirely")
+	} else if got != `"`+sum+`"` {
+		// The self-healed HEAD adopts the upstream hop's X-Linked-ETag, which
+		// for this fixture is the same sha256 the manifest recorded.
+		t.Logf("vanished-object HEAD ETag = %q (sha256 %q)", got, sum)
 	}
 
 	// A GET now re-populates the vanished object (HEAD never caches).

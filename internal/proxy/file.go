@@ -455,19 +455,23 @@ func parseByteRange(hdr string, size int64) (start, end int64, ok bool) {
 // ---- serving: HEAD miss ----
 
 // serveHeadMiss answers a cold HEAD from a lightweight upstream HEAD
-// against the SHA-pinned resolve URL. The shared client follows HF's 302 to
-// the CDN while preserving the HEAD method, so the final response carries
-// X-Linked-ETag / X-Linked-Size (or plain ETag/Content-Length). Nothing is
-// cached: HEAD never populates the cache, or HEAD-only objects would mint
-// manifest-less entries.
+// against the SHA-pinned resolve URL. The headClient does NOT follow HF's
+// 302 to the CDN: the pre-redirect hop carries X-Linked-ETag (the sha256
+// HF computes) and X-Linked-Size, which match what our warm HITs will serve
+// after caching. Following the redirect instead would adopt the CDN hop's
+// own ETag — a CAS-style hash for xet-backed LFS files — and flip against
+// our sha256 ETags once the file warms, making persistent-local_dir clients
+// re-download the file once. Nothing is cached: HEAD never populates the
+// cache, or HEAD-only objects would mint manifest-less entries.
 func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha, file string) {
 	p.m.AddMiss()
-	resp, err := p.fetchFile(r.Context(), http.MethodHead, resolvePath(repo, sha, file), "")
+	resp, err := p.headUpstream(r.Context(), resolvePath(repo, sha, file))
 	if err != nil {
 		p.fail(w, err)
 		return
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
@@ -483,7 +487,48 @@ func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha,
 	if v := resp.Header.Get("Content-Type"); v != "" {
 		h.Set("Content-Type", v)
 	}
-	w.WriteHeader(resp.StatusCode)
+	// The client sees 200 whether upstream answered on this hop (200) or
+	// pointed at its CDN (302): we consumed the redirect ourselves, and the
+	// file does exist upstream.
+	w.WriteHeader(http.StatusOK)
+}
+
+// headUpstream issues the no-follow HEAD with the file lane's retry policy
+// (one retry on connection errors and 5xx) and maps upstream statuses the
+// same way fetchResp does: 404 stays 404, other failures surface as 502.
+// A 302 here is the normal HF resolve hop — its headers are the point.
+func (p *Proxy) headUpstream(ctx context.Context, path string) (*http.Response, error) {
+	u := p.upstream + path
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		r, err := p.headClient.Do(req)
+		if err != nil {
+			if attempt == 1 {
+				return nil, &upstreamError{status: http.StatusBadGateway, msg: "upstream unreachable"}
+			}
+			continue
+		}
+		// Retry 5xx once (mirrors the lane policy); pass everything else.
+		if r.StatusCode >= 500 && attempt == 0 {
+			r.Body.Close()
+			continue
+		}
+		resp = r
+		break
+	}
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		resp.Body.Close()
+		return nil, &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream"}
+	case resp.StatusCode >= 400:
+		resp.Body.Close()
+		return nil, &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream error"}
+	}
+	return resp, nil
 }
 
 func resolvePath(repo, sha, file string) string {

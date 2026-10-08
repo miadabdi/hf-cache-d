@@ -124,15 +124,17 @@ func TestHFClientPublicSnapshot(t *testing.T) {
 	f := newFakeHub(t, repo, files)
 	srv := pushLane(t, st, f.upstream, "")
 
-	// Cold pull: exactly two upstream CDN hits per file (the stock client
-	// HEADs then GETs, and the proxy follows both to the CDN server-side) —
-	// the anchor that makes the warm zero-delta below self-evidencing.
+	// Cold pull: exactly one upstream CDN hit per file. The stock client
+	// HEADs then GETs; the proxy's HEAD stops at the pre-redirect hop
+	// (no CDN traffic — that is the ETag-stability fix), only the GET
+	// follows to the CDN. The anchor makes the warm zero-delta below
+	// self-evidencing.
 	cold := t.TempDir()
 	runClient(t, srv.URL, repo, "main", cold, false)
 	assertDirBytes(t, cold, files)
 	cdnAfterCold := f.cdnCount()
-	if want := 2 * len(files); cdnAfterCold != want {
-		t.Errorf("upstream CDN file requests after cold pull = %d, want %d (HEAD+GET per file)", cdnAfterCold, want)
+	if want := len(files); cdnAfterCold != want {
+		t.Errorf("upstream CDN file requests after cold pull = %d, want %d (GET per file; HEAD stays on the resolve hop)", cdnAfterCold, want)
 	}
 
 	// Warm pull: barrier FIRST (the cold pull's detached publish must be

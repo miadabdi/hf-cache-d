@@ -102,6 +102,17 @@ func newFakeHub(t *testing.T, repo string, files map[string][]byte) *fakeHub {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/"+repo+"/resolve/") {
+			// Like real HF: the pre-redirect hop stamps X-Linked-ETag
+			// (sha256) and X-Linked-Size, so a HEAD that stops here — our
+			// headClient — still gets full metadata.
+			rest := strings.TrimPrefix(r.URL.Path, "/"+repo+"/resolve/")
+			if _, file, ok := strings.Cut(rest, "/"); ok {
+				if body := f.files[file]; body != nil {
+					sum := sha256.Sum256(body)
+					w.Header().Set("X-Linked-ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+					w.Header().Set("X-Linked-Size", fmt.Sprint(len(body)))
+				}
+			}
 			w.Header().Set("Location", cdn.URL+r.URL.Path)
 			w.WriteHeader(http.StatusFound)
 			return
