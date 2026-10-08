@@ -4,6 +4,8 @@
 // table (newMux) and the compose SeaweedFS store: metadata → 3 files →
 // repeat; pass 2 must make zero upstream file requests and serve identical
 // bytes, and the durable manifest must carry the right sha256s.
+// Shared fixtures (fakeHub, pushLane, mustPut, mustSeal) live in
+// helpers_test.go.
 
 package test
 
@@ -13,109 +15,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/miadabdi/hf-cache-d/internal/local"
-	"github.com/miadabdi/hf-cache-d/internal/proxy"
-	"github.com/miadabdi/hf-cache-d/internal/push"
-	"github.com/miadabdi/hf-cache-d/internal/store"
 )
-
-// fakeHub is the same HF stand-in used by the proxy package tests, reduced
-// to what the e2e sequence needs: revision resolution and resolve→302→CDN.
-type fakeHub struct {
-	mu       sync.Mutex
-	repo     string
-	sha      string // commit served for "main"
-	files    map[string][]byte
-	cdnHits  int
-	upstream string
-}
-
-func (f *fakeHub) cdnCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.cdnHits
-}
-
-func newFakeHub(t *testing.T, repo string, files map[string][]byte) *fakeHub {
-	t.Helper()
-	// Unique commit sha per run: test packages run in parallel against one
-	// shared bucket and the manifest key carries only the sha, so parallel
-	// fixtures must not share one (a real commit sha identifies one repo).
-	uniq := sha256.Sum256([]byte(repo))
-	sha := hex.EncodeToString(uniq[:20]) // 40-hex, the commit shape
-	f := &fakeHub{repo: repo, sha: sha, files: files}
-	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		f.cdnHits++
-		rest := strings.TrimPrefix(r.URL.Path, "/"+repo+"/resolve/")
-		_, file, _ := strings.Cut(rest, "/")
-		body := f.files[file]
-		f.mu.Unlock()
-		if body == nil {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
-		w.Write(body)
-	}))
-	t.Cleanup(cdn.Close)
-
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if p, ok := strings.CutPrefix(r.URL.Path, "/api/models/"+repo+"/revision/"); ok {
-			s := f.sha
-			if p != "main" {
-				s = p
-			}
-			fmt.Fprintf(w, `{"sha":%q,"siblings":[]}`, s)
-			return
-		}
-		if strings.HasPrefix(r.URL.Path, "/"+repo+"/resolve/") {
-			w.Header().Set("Location", cdn.URL+r.URL.Path)
-			w.WriteHeader(http.StatusFound)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	t.Cleanup(hub.Close)
-	f.upstream = hub.URL
-	return f
-}
-
-// s3Endpoint: compose endpoint, SEAWEEDFS_S3_PORT aware.
-func s3Endpoint() string {
-	if e := os.Getenv("S3_TEST_ENDPOINT"); e != "" {
-		return e
-	}
-	if p := os.Getenv("SEAWEEDFS_S3_PORT"); p != "" {
-		return "http://localhost:" + p
-	}
-	return "http://localhost:8333"
-}
-
-func envOr(name, def string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return def
-}
 
 // TestSnapshotSequenceE2E: the full metadata→files→repeat flow.
 func TestSnapshotSequenceE2E(t *testing.T) {
+	st := newComposeStore(t)
 	repo := fmt.Sprintf("org/e2e-%d", time.Now().UnixNano())
 	big := bytes.Repeat([]byte("e2e-big-"), 1<<20) // 8 MiB
 	small := []byte("tiny")
@@ -126,35 +37,7 @@ func TestSnapshotSequenceE2E(t *testing.T) {
 		"nested/deep/file.txt": nested,
 	}
 	f := newFakeHub(t, repo, files)
-
-	st, err := store.New(s3Endpoint(), envOr("S3_BUCKET", "test-bucket"), envOr("S3_ACCESS_KEY", "test"), envOr("S3_SECRET_KEY", "test12345678"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Probe-and-skip, same contract as the store/proxy suites: unreachable
-	// endpoint or foreign SeaweedFS on the port skips with instructions.
-	hostport := strings.TrimPrefix(strings.TrimPrefix(s3Endpoint(), "http://"), "https://")
-	if conn, err := net.DialTimeout("tcp", hostport, 2*time.Second); err != nil {
-		t.Skipf("S3 endpoint %s not reachable (docker compose up -d && ./scripts/dev-s3.sh): %v", s3Endpoint(), err)
-	} else {
-		conn.Close()
-	}
-	if _, _, err := st.Get(context.Background(), "auth-probe"); err != nil && !errors.Is(err, store.ErrNotFound) {
-		t.Skipf("S3 endpoint %s reachable but not usable with fixture creds: %v", s3Endpoint(), err)
-	}
-
-	// The routing table mirrors cmd/hf-cache-d's newMux exactly (metadata
-	// lane + file lane on a child mux under "/"); cmd packages are not
-	// importable, so the shape is duplicated here deliberately. The mux
-	// wiring itself is covered by cmd/hf-cache-d's handler tests.
-	mux := http.NewServeMux()
-	p := proxy.New(f.upstream, st)
-	p.Register(mux)
-	fileMux := http.NewServeMux()
-	p.RegisterFiles(fileMux)
-	mux.Handle("/", fileMux)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+	srv := pushLane(t, st, f.upstream, "")
 
 	paths := []string{"big.bin", "small.bin", "nested/deep/file.txt"}
 	sums := map[string]string{}
@@ -183,34 +66,7 @@ func TestSnapshotSequenceE2E(t *testing.T) {
 			// returned. Every file must be manifest-published and its object
 			// headed before pass 2 can assert HIT/zero-traffic — otherwise
 			// correct code fails the test.
-			deadline := time.Now().Add(30 * time.Second)
-			for _, file := range paths {
-				ok := false
-				for time.Now().Before(deadline) {
-					rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/manifest.json", f.sha[:2], f.sha))
-					if err == nil {
-						var m struct {
-							Files map[string]string `json:"files"`
-						}
-						if json.NewDecoder(rc).Decode(&m) == nil && m.Files[file] == sums[file] {
-							rc.Close()
-							ok = true
-							break
-						}
-					}
-					if rc != nil {
-						rc.Close()
-					}
-					time.Sleep(50 * time.Millisecond)
-				}
-				if !ok {
-					t.Fatalf("pass 2 barrier: %s never published to the manifest", file)
-				}
-				exists, _, err := st.Head(context.Background(), fmt.Sprintf("pub/%s/%s/%s/%s", f.sha[:2], f.sha, repo, file))
-				if err != nil || !exists {
-					t.Fatalf("pass 2 barrier: object for %s missing (err %v)", file, err)
-				}
-			}
+			barrier(t, st, f.sha, repo, files)
 		}
 
 		// Metadata first, like a real pull.
@@ -274,79 +130,6 @@ func TestSnapshotSequenceE2E(t *testing.T) {
 	}
 }
 
-// pushLane wires a push lane + proxy + local index cache against st and the
-// given upstream, mirroring newMux's shape (compose tests cannot import cmd).
-func pushLane(t *testing.T, st *store.Store, upstream string, token string) *httptest.Server {
-	t.Helper()
-	ix := local.NewIndexes(st)
-	p := proxy.New(upstream, st)
-	p.SetLocalIndexes(ix)
-	pl := push.New(token, st, ix)
-	mux := http.NewServeMux()
-	p.Register(mux)
-	pl.Register(mux)
-	files := http.NewServeMux()
-	p.RegisterFiles(files)
-	mux.Handle("/", files)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-// mustPut stages a file through the authenticated push lane.
-func mustPut(t *testing.T, base, repo, version, file string, body []byte) string {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodPut,
-		base+"/v1/artifacts/"+repo+"/"+version+"/"+file, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer sekrit")
-	req.ContentLength = int64(len(body))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("push put %s: status %d", file, resp.StatusCode)
-	}
-	var out struct {
-		SHA256 string `json:"sha256"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return out.SHA256
-}
-
-// mustSeal posts the seal manifest and returns the synthetic commit.
-func mustSeal(t *testing.T, base, repo, version string, files map[string]string, sizes map[string]int64) string {
-	t.Helper()
-	body, _ := json.Marshal(map[string]any{"files": files, "sizes": sizes})
-	req, err := http.NewRequest(http.MethodPost,
-		base+"/v1/artifacts/"+repo+"/"+version+"/manifest", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer sekrit")
-	req.ContentLength = int64(len(body))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("seal: status %d (%s)", resp.StatusCode, raw)
-	}
-	var out struct {
-		Commit string `json:"commit"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	return out.Commit
-}
-
 // TestPrivatePushRoundtripE2E: PUT 2 files → seal → snapshot-shaped GET
 // sequence twice through the HF routes; pass 2 makes zero upstream requests
 // and serves byte-identical bytes from the sealed objects.
@@ -359,20 +142,7 @@ func TestPrivatePushRoundtripE2E(t *testing.T) {
 	}))
 	t.Cleanup(pub.Close)
 
-	st, err := store.New(s3Endpoint(), envOr("S3_BUCKET", "test-bucket"), envOr("S3_ACCESS_KEY", "test"), envOr("S3_SECRET_KEY", "test12345678"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostport := strings.TrimPrefix(strings.TrimPrefix(s3Endpoint(), "http://"), "https://")
-	if conn, err := net.DialTimeout("tcp", hostport, 2*time.Second); err != nil {
-		t.Skipf("S3 endpoint %s not reachable (docker compose up -d && ./scripts/dev-s3.sh): %v", s3Endpoint(), err)
-	} else {
-		conn.Close()
-	}
-	if _, _, err := st.Get(context.Background(), "auth-probe"); err != nil && !errors.Is(err, store.ErrNotFound) {
-		t.Skipf("S3 endpoint %s reachable but not usable with fixture creds: %v", s3Endpoint(), err)
-	}
-
+	st := newComposeStore(t)
 	repo := fmt.Sprintf("org/push-e2e-%d", time.Now().UnixNano())
 	srv := pushLane(t, st, pub.URL, "sekrit")
 
