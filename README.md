@@ -103,7 +103,14 @@ Exactly these routes are implemented (everything else 404s):
 |---|---|
 | `GET /v1/artifacts/{org}/{name}` | Version listing (anonymous). |
 | `PUT /v1/artifacts/{org}/{name}/{version}/{file}` | Stage a file (bearer token; `Content-Length` required). Returns `{file, sha256, size}`. |
-| `POST /v1/artifacts/{org}/{name}/{version}/manifest` | Seal the version (bearer). Body `{"files":{path:sha256}}`; staged bytes are re-hashed server-side and must match. Returns the synthetic `{version, commit}`. |
+| `POST /v1/artifacts/{org}/{name}/{version}/manifest` | Seal the version (bearer). Body `{"files":{path:sha256}}`; the exact staged file set is required and bytes are re-hashed server-side. Returns the synthetic `{version, commit}`. |
+
+Public file manifests live at `pub/<sha-prefix>/<sha>/<org>/<name>/manifest.json`
+(repo-scoped, so forks may share a SHA); staged paths live at
+`priv/<org>/<name>/<version>/stage.json` and are marked sealed on success.
+Metadata bodies and encoded cached envelopes are capped at 32 MiB each;
+query values are capped at 1024 bytes, repeated parameters keep the first,
+and cursors accept only `A-Za-z0-9._~=/+-` (invalid values get 400).
 
 **Operational:** `GET /healthz` (`{"status":"ok","version":...}`), `GET /`
 (route index), `GET /metricsz` (Prometheus text).
@@ -229,6 +236,8 @@ unit is in `deploy/hf-cache-d.service` — reference only, nothing installs it.
   stop the server-side fetch (caching to completion is the feature); there
   is no concurrency cap or per-transfer deadline. Fine on a trusted network,
   dangerous on a hostile one.
+- **Shutdown boundary.** A restart/SIGTERM aborts in-flight cold transfers;
+  partial objects are never served and the next request re-fetches cold.
 - **In-process locks.** Concurrent pulls of the same file from one process
   are serialized per-release; cross-process coordination does not exist.
 - **One tested client version.** `huggingface_hub` 0.36.2 is the verified
