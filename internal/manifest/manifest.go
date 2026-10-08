@@ -22,6 +22,12 @@ type Manifest struct {
 	Sizes    map[string]int64  // repo-relative file path → byte size
 	PulledAt time.Time
 	Upstream string // upstream base URL the data came from
+
+	// CacheKey is the store object key this manifest was loaded from or
+	// published to. It is in-memory only (never serialized: the stored JSON
+	// is canonical across writers) and lets the integrity self-check verify
+	// recently-served manifests without bucket listing.
+	CacheKey string `json:"-"`
 }
 
 // HashReader streams r through sha256 and returns the hex digest and the

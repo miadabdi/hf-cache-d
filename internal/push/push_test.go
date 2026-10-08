@@ -28,7 +28,7 @@ type pstore struct {
 	mu                  sync.Mutex
 	objs                map[string][]byte
 	failPutKeys         map[string]bool
-	failGet             bool           // every Get fails (transient S3 outage)
+	failGet             bool            // every Get fails (transient S3 outage)
 	failHeadKeys        map[string]bool // only these keys fail Head
 	hookIndexPut        func()          // runs before an index-key Put
 	indexPutAttempts    int
@@ -103,15 +103,14 @@ func (m *pstore) Head(_ context.Context, key string) (bool, int64, error) {
 	return ok, int64(len(b)), nil
 }
 
-
 // lane wires one push lane + proxy + index cache against a store and a fake
 // public upstream; returned so tests can assert zero-upstream behavior.
 type lane struct {
-	srv *httptest.Server
-	st  *pstore
-	pl  *Lane
-	p   *proxy.Proxy
-	up  *httptest.Server
+	srv    *httptest.Server
+	st     *pstore
+	pl     *Lane
+	p      *proxy.Proxy
+	up     *httptest.Server
 	upHits *int32
 }
 
@@ -305,7 +304,7 @@ func TestPushValidation(t *testing.T) {
 func TestStageAndSealHappyPath(t *testing.T) {
 	l := newLane(t, "tok")
 	files := map[string][]byte{
-		"model.bin":       []byte("weights"),
+		"model.bin":          []byte("weights"),
 		"nested/config.json": []byte(`{"a":1}`),
 	}
 	sums := stageAll(t, l, "org/priv", "v1", files)
@@ -493,7 +492,7 @@ func TestLocalModelShadowingAndServing(t *testing.T) {
 	commit3 := out3["commit"].(string)
 
 	v2 := map[string][]byte{
-		"model.bin":     []byte("v2 weights"),
+		"model.bin":       []byte("v2 weights"),
 		"nested/cfg.json": []byte("{}"),
 	}
 	sums2 := stageAll(t, l, repo, "v2", v2)
@@ -814,7 +813,6 @@ func TestConcurrentStageAndSealSerialized(t *testing.T) {
 	}
 }
 
-
 // ---- review round 1 covering tests ----
 
 // TestStoreFailureNeverFallsBackToPublic (item 1): when the index read
@@ -1124,7 +1122,6 @@ func TestConcurrentSealsDifferentVersionsBothIndexed(t *testing.T) {
 		t.Error("main pointer missing after concurrent seals")
 	}
 }
-
 
 // ---- review round 2 covering tests ----
 

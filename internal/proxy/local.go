@@ -74,6 +74,7 @@ func (p *Proxy) localManifest(r *http.Request, repo, version string) (*manifest.
 		p.manMu.Unlock()
 		return cur, nil
 	}
+	m.CacheKey = sealKey(repo, version)
 	p.manifests[sealKey(repo, version)] = &m
 	p.manMu.Unlock()
 	return &m, nil

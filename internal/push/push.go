@@ -22,6 +22,7 @@ import (
 
 	"github.com/miadabdi/hf-cache-d/internal/local"
 	"github.com/miadabdi/hf-cache-d/internal/manifest"
+	"github.com/miadabdi/hf-cache-d/internal/metrics"
 )
 
 // manifestMaxBytes caps the seal request body (small JSON: path→sha map).
@@ -47,6 +48,7 @@ type Lane struct {
 	token string // empty = lane disabled (404 on PUT/POST)
 	store Store
 	index *local.Indexes
+	m     *metrics.Counters // bytes-pulled counter for staged uploads
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // "org/name@version" -> staging/seal lock
@@ -65,8 +67,12 @@ func New(token string, st Store, ix *local.Indexes) *Lane {
 		index:    ix,
 		locks:    map[string]*sync.Mutex{},
 		repoLock: map[string]*sync.Mutex{},
+		m:        metrics.Default,
 	}
 }
+
+// SetCounters installs a private counter set (tests).
+func (l *Lane) SetCounters(c *metrics.Counters) { l.m = c }
 
 // Register mounts the push routes on mux (the parent mux; /v1/artifacts/ is
 // a literal subtree that wins over the file lane's "/").
@@ -194,6 +200,7 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 		return
 	}
 	sum := hex.EncodeToString(hash.Sum(nil))
+	l.m.AddBytesPulled(r.ContentLength)
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"file":   file,
 		"sha256": sum,

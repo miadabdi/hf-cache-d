@@ -21,6 +21,7 @@ import (
 
 	"github.com/miadabdi/hf-cache-d/internal/local"
 	"github.com/miadabdi/hf-cache-d/internal/manifest"
+	"github.com/miadabdi/hf-cache-d/internal/metrics"
 	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
@@ -68,6 +69,11 @@ type Proxy struct {
 	// push lane's index cache; reads then check locals BEFORE the public
 	// flow (the shadowing rule).
 	locals *local.Indexes
+
+	// m is the process-wide counter set the lanes increment. It is the
+	// metrics.Default singleton, never nil in production; the field exists
+	// so tests can assert on a private instance.
+	m *metrics.Counters
 }
 
 type refEntry struct {
@@ -86,8 +92,12 @@ func New(upstream string, st storeAPI) *Proxy {
 		refs:       map[string]refEntry{},
 		manifests:  map[string]*manifest.Manifest{},
 		releaseMu:  map[string]*sync.Mutex{},
+		m:          metrics.Default,
 	}
 }
+
+// SetCounters installs a private counter set (tests).
+func (p *Proxy) SetCounters(c *metrics.Counters) { p.m = c }
 
 // Register mounts the metadata routes on mux. The /api/models/ subtree is
 // claimed wholesale; the file lane (RegisterFiles) cannot share this mux —
@@ -302,6 +312,7 @@ func (p *Proxy) servePinned(w http.ResponseWriter, r *http.Request, repo, sha, k
 		p.fail(w, err)
 		return
 	}
+	p.m.AddBytesPulled(int64(len(body)))
 	env, _ := json.Marshal(cachedResp{Link: link, Body: string(body)})
 	if err := p.store.Put(r.Context(), key, bytes.NewReader(env), int64(len(env))); err != nil {
 		// Serving fresh data still works; only persistence failed.
@@ -335,6 +346,12 @@ func (p *Proxy) readCached(ctx context.Context, key string) (body []byte, link s
 // the current request even on cache hits, so a warm page-1 always carries a
 // next-page URL pointing at this service.
 func (p *Proxy) writeBody(w http.ResponseWriter, r *http.Request, body []byte, cache, sha, link string) {
+	switch cache {
+	case "HIT":
+		p.m.AddHit()
+	case "MISS":
+		p.m.AddMiss()
+	}
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
 	h.Set("X-Cache", cache)
@@ -361,6 +378,7 @@ func (p *Proxy) writeErr(w http.ResponseWriter, status int, msg string) {
 func (p *Proxy) fail(w http.ResponseWriter, err error) {
 	var ue *upstreamError
 	if errors.As(err, &ue) {
+		p.m.AddUpstreamError()
 		p.writeErr(w, ue.status, ue.msg)
 		return
 	}
@@ -431,6 +449,7 @@ func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byt
 	if err != nil {
 		return nil, "", &upstreamError{status: http.StatusBadGateway, msg: "upstream read error"}
 	}
+	p.m.AddBytesPulled(int64(len(body)))
 	return body, resp.Header.Get("Link"), nil
 }
 

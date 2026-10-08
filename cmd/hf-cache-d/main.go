@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/miadabdi/hf-cache-d/internal/local"
+	"github.com/miadabdi/hf-cache-d/internal/metrics"
 	"github.com/miadabdi/hf-cache-d/internal/proxy"
 	"github.com/miadabdi/hf-cache-d/internal/push"
 	"github.com/miadabdi/hf-cache-d/internal/store"
@@ -41,14 +42,22 @@ func main() {
 		log.Fatalf("s3 store: %v", err)
 	}
 
-	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           newMux(cfg.HFUpstream, cfg.PushToken, st),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	handler, p := newMux(cfg.HFUpstream, cfg.PushToken, st)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Periodic manifest integrity self-check (disabled at interval 0). It
+	// shares the shutdown context: srv.Shutdown below outlives it via ctx.
+	if cfg.IntegrityCheckInterval > 0 {
+		go runIntegrityChecks(ctx, st, p, log.Default(), cfg.IntegrityCheckInterval)
+	}
+
+	srv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	go func() {
 		log.Printf("hf-cache-d %s listening on %s (upstream %s)", version, cfg.ListenAddr, cfg.HFUpstream)
@@ -81,7 +90,7 @@ func main() {
 //
 // /metricsz (Task 5) must also mount on the PARENT mux (as a literal or
 // subtree, which always wins over "/"); anything left falls to the file lane.
-func newMux(upstream, pushToken string, st *store.Store) *http.ServeMux {
+func newMux(upstream, pushToken string, st *store.Store) (http.Handler, *proxy.Proxy) {
 	// *store.Store satisfies muxStore; the indirection exists for the
 	// handler tests' in-memory fake.
 	return newMuxAny(upstream, pushToken, st)
@@ -89,7 +98,8 @@ func newMux(upstream, pushToken string, st *store.Store) *http.ServeMux {
 
 // newMuxAny is newMux over the narrow store interface, so handler tests
 // can pass their in-memory fake while production passes *store.Store.
-func newMuxAny(upstream, pushToken string, st muxStore) *http.ServeMux {
+// Returned proxy feeds the integrity self-check's manifest source.
+func newMuxAny(upstream, pushToken string, st muxStore) (http.Handler, *proxy.Proxy) {
 	// The sealed-local index cache is shared: the proxy reads it (shadowing
 	// rule) and the push lane refreshes it on seal.
 	ix := local.NewIndexes(st)
@@ -99,14 +109,18 @@ func newMuxAny(upstream, pushToken string, st muxStore) *http.ServeMux {
 	pl := push.New(pushToken, st, ix)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
-	p.Register(mux) // /api/models/
+	mux.HandleFunc("/metricsz", handleMetricsz)
+	p.Register(mux)  // /api/models/
 	pl.Register(mux) // /v1/artifacts/
 	files := http.NewServeMux()
 	p.RegisterFiles(files)
-	mux.Handle("/", files)
+	mux.Handle("/", logMiddleware(metrics.Default, accessLogger)(files))
 	mux.HandleFunc("/{$}", handleIndex)
-	return mux
+	return logMiddleware(metrics.Default, accessLogger)(mux), p
 }
+
+// accessLogger is the process-wide request logger (stderr, plain text).
+var accessLogger = log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
 
 // muxStore is the union of the store slices the lanes consume.
 type muxStore interface {
@@ -130,6 +144,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"routes": []string{
 		"/healthz",
+		"/metricsz",
 		"/api/models/{repo}",
 		"/api/models/{repo}/revision/{rev}",
 		"/api/models/{repo}/tree/{rev}",

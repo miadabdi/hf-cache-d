@@ -14,8 +14,9 @@ import (
 
 // newTestMux wires the mux with a proxy against a dead upstream: handler
 // tests here never touch the metadata lane's upstream path.
-func newTestMux() *http.ServeMux {
-	return newMuxAny("http://127.0.0.1:0", "", &nopStore{})
+func newTestMux() http.Handler {
+	mux, _ := newMuxAny("http://127.0.0.1:0", "", &nopStore{})
+	return mux
 }
 
 type nopStore struct{}

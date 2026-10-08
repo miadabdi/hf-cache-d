@@ -192,6 +192,7 @@ func (p *Proxy) loadManifest(ctx context.Context, sha string) *manifest.Manifest
 		log.Printf("manifest for %s not valid, treating as absent", sha)
 		return nil
 	}
+	m.CacheKey = manifestKeyOf(sha)
 	return &m
 }
 
@@ -202,6 +203,9 @@ func (p *Proxy) installIfNewer(sha string, m *manifest.Manifest) *manifest.Manif
 	p.manMu.Lock()
 	defer p.manMu.Unlock()
 	if cur, ok := p.manifests[sha]; ok {
+		if cur.CacheKey == "" {
+			cur.CacheKey = m.CacheKey
+		}
 		for file := range m.Files {
 			if _, exists := cur.Files[file]; !exists {
 				// The store read knew a file the cache lacks: merge it in.
@@ -276,6 +280,7 @@ func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string, si
 		log.Printf("manifest put %s: %v", key, err)
 		return
 	}
+	next.CacheKey = key
 	p.manMu.Lock()
 	p.manifests[sha] = &next
 	p.manMu.Unlock()
@@ -294,6 +299,20 @@ func (p *Proxy) muFor(sha string) *sync.Mutex {
 	return mu
 }
 
+// ManifestKeys lists the store keys of every manifest held in the read
+// cache (public release manifests and seal manifests alike). It feeds the
+// cmd's integrity self-check, which needs candidate manifests to verify but
+// must not list the bucket (the store has no List).
+func (p *Proxy) ManifestKeys() []string {
+	p.manMu.Lock()
+	defer p.manMu.Unlock()
+	keys := make([]string, 0, len(p.manifests))
+	for _, m := range p.manifests {
+		keys = append(keys, m.CacheKey)
+	}
+	return keys
+}
+
 // ---- serving: cache hit ----
 
 // serveHit serves a manifest-backed object. The manifest is authoritative
@@ -305,6 +324,7 @@ func (p *Proxy) muFor(sha string) *sync.Mutex {
 // are the lane-specific miss continuations (upstream fetch for the public
 // lane, 404 for local models — a sealed local file has no upstream).
 func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file, key, sum string, size int64, onMiss, onGetMiss func()) {
+	p.m.AddHit()
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "HIT")
@@ -428,6 +448,7 @@ func parseByteRange(hdr string, size int64) (start, end int64, ok bool) {
 // cached: HEAD never populates the cache, or HEAD-only objects would mint
 // manifest-less entries.
 func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha, file string) {
+	p.m.AddMiss()
 	resp, err := p.fetchFile(r.Context(), http.MethodHead, resolvePath(repo, sha, file), "")
 	if err != nil {
 		p.fail(w, err)
@@ -488,6 +509,7 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 	}
 
 	ctx := context.Background() // detached: see comment above
+	p.m.AddMiss()
 	resp, err := p.fetchFile(ctx, http.MethodGet, resolvePath(repo, sha, file), "")
 	if err != nil {
 		p.fail(w, err)
@@ -561,7 +583,8 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 			return
 		}
 	}
-	pw.Close() // EOF: let the upload finish
+	pw.Close()                  // EOF: let the upload finish
+	p.m.AddBytesPulled(relayed) // full-body ingest only: ranged relays store nothing
 
 	if perr := <-putDone; perr != nil {
 		// Client got the full body; the partial object is garbage and stays
@@ -575,6 +598,7 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 // relayStatus relays a non-200 upstream GET answer (e.g. a 304 or 404 that
 // slipped past the status mapping) verbatim.
 func (p *Proxy) relayStatus(w http.ResponseWriter, resp *http.Response, sha string) {
+	p.m.AddMiss()
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "MISS")
@@ -591,6 +615,7 @@ func (p *Proxy) relayStatus(w http.ResponseWriter, resp *http.Response, sha stri
 // Range header and caches nothing: partial responses never populate the
 // cache, so the file stays a MISS until a full GET happens.
 func (p *Proxy) relayColdRange(w http.ResponseWriter, r *http.Request, repo, sha, file, rg string) {
+	p.m.AddMiss()
 	resp, err := p.fetchFile(r.Context(), http.MethodGet, resolvePath(repo, sha, file), rg)
 	if err != nil {
 		p.fail(w, err)

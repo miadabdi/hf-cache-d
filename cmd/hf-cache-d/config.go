@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // Config is the full runtime configuration, sourced from environment variables.
@@ -15,6 +16,11 @@ type Config struct {
 	S3SecretKey string // S3_SECRET_KEY, required
 	HFUpstream  string // HF_UPSTREAM, default "https://huggingface.co"
 	PushToken   string // PUSH_TOKEN, empty means push lane disabled
+
+	// IntegrityCheckInterval is how often the background self-check verifies
+	// one random manifest's files (sha256 of stored bytes vs the manifest).
+	// Zero disables the self-check entirely.
+	IntegrityCheckInterval time.Duration // INTEGRITY_CHECK_INTERVAL, default 1h
 }
 
 // LoadConfig reads the environment and validates required variables,
@@ -34,6 +40,14 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.HFUpstream == "" {
 		cfg.HFUpstream = "https://huggingface.co"
+	}
+	cfg.IntegrityCheckInterval = time.Hour
+	if v := strings.TrimSpace(os.Getenv("INTEGRITY_CHECK_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return Config{}, fmt.Errorf("INTEGRITY_CHECK_INTERVAL must be a non-negative duration (e.g. 1h, 30m), got %q", v)
+		}
+		cfg.IntegrityCheckInterval = d // 0 disables
 	}
 
 	switch {
