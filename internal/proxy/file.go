@@ -498,11 +498,15 @@ func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha,
 			} else {
 				io.Copy(io.Discard, io.LimitReader(r2.Body, 4<<10))
 				r2.Body.Close()
-				// The final hop knows the true length (and, for xet files,
-				// a CAS ETag — deliberately NOT adopted; the sha256 truth
-				// arrives with the manifest on warm).
+				// The followed hop carries the true length AND its own
+				// ETag — BOTH must be relayed: hf_hub hard-raises
+				// FileMetadataError on a missing ETag before any size
+				// logic runs, and the wrong size breaks the consistency
+				// check after it. (v0.1.3: etag without size; v0.1.4:
+				// size without etag; both were one-argument fixes.)
+				etag := firstNonEmpty(r2.Header.Get("X-Linked-ETag"), r2.Header.Get("ETag"))
 				if v := firstNonEmpty(r2.Header.Get("X-Linked-Size"), r2.Header.Get("Content-Length")); v != "" {
-					p.writeHeadMissHeaders(w, sha, "", v, r2.Header.Get("Content-Type"))
+					p.writeHeadMissHeaders(w, sha, etag, v, r2.Header.Get("Content-Type"))
 					return
 				}
 			}

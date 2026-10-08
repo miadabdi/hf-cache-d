@@ -1168,3 +1168,38 @@ func TestBadRevisionGetsRevisionNotFound(t *testing.T) {
 		t.Errorf("file lane bad revision X-Error-Code = %q, want RevisionNotFound", got)
 	}
 }
+
+// TestColdNonLFSHeadCompleteMetadata is THE regression test of the whole
+// v0.1.2-v0.1.4 saga: a cold HEAD on a non-LFS file through the mirror
+// must carry BOTH a correct Content-Length (not the redirect-message
+// length) AND a non-empty ETag (hf_hub hard-raises FileMetadataError on a
+// missing ETag before any size logic). Each earlier variant failed exactly
+// one of the two: v0.1.3 right etag/wrong size, v0.1.4 right size/no etag.
+func TestColdNonLFSHeadCompleteMetadata(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := bytes.Repeat([]byte("n"), 791)
+	addFile(t, f, ".gitattributes", body)
+	f.mu.Lock()
+	f.lfs[".gitattributes"] = false // non-LFS: relative-Location 307 hop
+	f.mu.Unlock()
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodHead, srv.URL+"/org/name/resolve/main/.gitattributes", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cold HEAD status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "791" {
+		t.Errorf("Content-Length = %q, want 791 (true size from the followed hop)", got)
+	}
+	if got := resp.Header.Get("ETag"); got == "" {
+		t.Error("ETag empty — hf_hub raises FileMetadataError before size logic; the followed hop's ETag must be relayed")
+	}
+}
