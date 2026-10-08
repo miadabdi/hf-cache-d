@@ -69,6 +69,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           if [[ "$GITHUB_REF" != refs/tags/* ]]; then VERSION="$(git rev-parse --short HEAD)"; fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           docker build --build-arg VERSION="$VERSION" -t hf-cache-d:ci .
 
       - name: Smoke against compose SeaweedFS
@@ -90,6 +91,8 @@ jobs:
           done
           echo "healthz: $body"
           echo "$body" | grep -q '"status":"ok"' || { docker logs smoke; exit 1; }
+          # ldflags version baked in, not the default "dev".
+          echo "$body" | grep -q "\"version\":\"$VERSION\"" || { echo "version not baked in"; docker logs smoke; exit 1; }
           curl -sf http://localhost:18080/ >/dev/null   # route index answers
           curl -sf http://localhost:18080/metricsz | head -3
           docker rm -f smoke

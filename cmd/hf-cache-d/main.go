@@ -114,8 +114,10 @@ func newMuxAny(upstream, pushToken string, st muxStore) (http.Handler, *proxy.Pr
 	pl.Register(mux) // /v1/artifacts/
 	files := http.NewServeMux()
 	p.RegisterFiles(files)
-	mux.Handle("/", logMiddleware(metrics.Default, accessLogger)(files))
+	mux.Handle("/", files)
 	mux.HandleFunc("/{$}", handleIndex)
+	// One middleware around the WHOLE tree: every request is logged and
+	// counted exactly once, including the child-mux file lane.
 	return logMiddleware(metrics.Default, accessLogger)(mux), p
 }
 
