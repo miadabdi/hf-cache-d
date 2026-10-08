@@ -204,11 +204,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 // fetch (HF ignores unknown params), so arbitrary input cannot mint
 // unbounded permanent S3 keys.
 var allowedParams = map[string]bool{
-	"recursive":      true,
-	"cursor":         true,
-	"expand":         true,
-	"limit":          true,
-	"files_metadata": true, // sibling size info: callers verify sizes for adoption/corruption checks
+	"recursive": true,
+	"cursor":    true,
+	"expand":    true,
+	"limit":     true,
+	"blobs":     true, // sibling size info — the param hf_hub 0.36.x actually sends on the wire
 }
 
 // allowQuery canonicalizes allowlisted values. Duplicate occurrences keep
@@ -500,6 +500,11 @@ func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byt
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream", code: "RepoNotFound"}
+	case resp.StatusCode == http.StatusUnauthorized:
+		// HF answers 401 for anonymous requests to nonexistent/private
+		// repos; to an anonymous mirror that is indistinguishable from
+		// unknown-repo, and stock clients expect the typed 404.
+		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "repository not found", code: "RepoNotFound"}
 	case resp.StatusCode >= 400:
 		return nil, "", &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream error"}
 	}

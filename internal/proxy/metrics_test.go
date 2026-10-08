@@ -190,7 +190,8 @@ func TestMetricsNotFoundSeparateFromUpstreamErrors(t *testing.T) {
 		t.Errorf("upstream_errors after 404 = %s, want 0 (404 is not a failure)", errs)
 	}
 
-	// Metadata 404 same discipline.
+	// Metadata unknown-repo (upstream answers 401): mapped to a typed
+	// repo-404, same not-found discipline.
 	proxyGet(t, srv.URL+"/api/models/org/absent-repo", nil)
 	if nf := countOf(t, c, "hf_cache_upstream_not_found_total"); nf != "2" {
 		t.Errorf("upstream_not_found after metadata 404 = %s, want 2", nf)

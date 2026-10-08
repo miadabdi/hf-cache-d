@@ -473,23 +473,56 @@ func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha,
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 
+	// Non-LFS files: HF answers the SHA-pinned resolve with a 307 whose
+	// Content-Length is the redirect MESSAGE, not the file. Never trust a
+	// hop lacking X-Linked-Size: follow the redirect once (fileClient
+	// follows it fully) and read the true size there. A cold HEAD relaying
+	// the message length breaks snapshot_download's consistency check.
+	if resp.Header.Get("X-Linked-Size") == "" && resp.Header.Get("X-Linked-ETag") == "" {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			req2, err := http.NewRequestWithContext(r.Context(), http.MethodHead, loc, nil)
+			if err == nil {
+				if r2, err := p.fileClient.Do(req2); err == nil {
+					io.Copy(io.Discard, io.LimitReader(r2.Body, 4<<10))
+					r2.Body.Close()
+					// The final hop knows the true length (and, for xet
+					// files, a CAS ETag — deliberately NOT adopted; the
+					// sha256 truth arrives with the manifest on warm).
+					if v := firstNonEmpty(r2.Header.Get("X-Linked-Size"), r2.Header.Get("Content-Length")); v != "" {
+						p.writeHeadMissHeaders(w, sha, "", v, r2.Header.Get("Content-Type"))
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// LFS files: the pre-redirect hop carries the sha256 ETag and true size
+	// (X-Linked-*), which match what warm HITs serve.
+	p.writeHeadMissHeaders(w, sha,
+		firstNonEmpty(resp.Header.Get("X-Linked-ETag"), resp.Header.Get("ETag")),
+		firstNonEmpty(resp.Header.Get("X-Linked-Size"), resp.Header.Get("Content-Length")),
+		resp.Header.Get("Content-Type"))
+}
+
+// writeHeadMissHeaders emits the cold-HEAD 200 with whichever metadata the
+// (possibly followed) hop provided. The client always sees 200: we consumed
+// the redirect(s) ourselves and the file exists upstream.
+func (p *Proxy) writeHeadMissHeaders(w http.ResponseWriter, sha, etag, size, ctype string) {
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "MISS")
 	h.Set("Accept-Ranges", "bytes")
 	h.Del("ETag")
-	if v := firstNonEmpty(resp.Header.Get("X-Linked-ETag"), resp.Header.Get("ETag")); v != "" {
-		h.Set("ETag", v)
+	if etag != "" {
+		h.Set("ETag", etag)
 	}
-	if v := firstNonEmpty(resp.Header.Get("X-Linked-Size"), resp.Header.Get("Content-Length")); v != "" {
-		h.Set("Content-Length", v)
+	if size != "" {
+		h.Set("Content-Length", size)
 	}
-	if v := resp.Header.Get("Content-Type"); v != "" {
-		h.Set("Content-Type", v)
+	if ctype != "" {
+		h.Set("Content-Type", ctype)
 	}
-	// The client sees 200 whether upstream answered on this hop (200) or
-	// pointed at its CDN (302): we consumed the redirect ourselves, and the
-	// file does exist upstream.
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -779,7 +812,11 @@ func (p *Proxy) relayColdRange(w http.ResponseWriter, r *http.Request, repo, sha
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "MISS")
-	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "ETag", "Accept-Ranges"} {
+	// No ETag: the ranged hop's ETag is the CDN's CAS hash for xet files,
+	// which flips against the sha256 our warm ranged HITs serve. Omitting
+	// it costs nothing (clients re-derive the tag after the warm) and keeps
+	// cold/warm consistent.
+	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
 		if v := resp.Header.Get(k); v != "" {
 			h.Set(k, v)
 		}

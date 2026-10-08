@@ -37,6 +37,7 @@ func addFile(t *testing.T, f *fakeUpstream, name string, body []byte) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.files[name] = body
+	f.lfs[name] = true // default: LFS-style hop (X-Linked-* on the redirect); tests opt out for the 307 shape
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
 }
@@ -991,10 +992,12 @@ func TestXErrorCodeOn404s(t *testing.T) {
 		t.Errorf("file 404 X-Error-Code = %q, want EntryNotFound", got)
 	}
 
-	// Metadata lane: unknown repo → RepoNotFound.
+	// Metadata lane: unknown repo → HF answers 401 to anonymous requests;
+	// the mirror must surface that as a typed repo-404 (stock clients raise
+	// RepositoryNotFoundError), never an untyped 502.
 	resp2, _ := proxyGet(t, srv.URL+"/api/models/org/absent-repo", nil)
 	if resp2.StatusCode != http.StatusNotFound {
-		t.Fatalf("absent repo status = %d, want 404", resp2.StatusCode)
+		t.Fatalf("absent repo status = %d, want 404 (mapped from upstream 401)", resp2.StatusCode)
 	}
 	if got := resp2.Header.Get("X-Error-Code"); got != "RepoNotFound" {
 		t.Errorf("metadata 404 X-Error-Code = %q, want RepoNotFound", got)
@@ -1075,5 +1078,61 @@ func TestColdRangeGETTriggersWarm(t *testing.T) {
 	}
 	if !bytes.Equal(got2, body) {
 		t.Errorf("post-warm body mismatch")
+	}
+}
+
+// TestColdHeadNonLFS307TrueSize (regression A, v0.1.1): HF answers
+// SHA-pinned non-LFS resolves with a 307 whose Content-Length is the
+// redirect MESSAGE, not the file. The cold HEAD must never trust that
+// length — it follows the redirect once and reports the real size, else
+// cold snapshot_download fails its consistency check
+// ("file should be of size X but has size Y").
+func TestColdHeadNonLFS307TrueSize(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := bytes.Repeat([]byte("n"), 791) // actual size 791; the 307 hop's message is 43
+	addFile(t, f, ".gitattributes", body)
+	f.mu.Lock()
+	f.lfs[".gitattributes"] = false // non-LFS: 307 hop without X-Linked-*
+	f.mu.Unlock()
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodHead, srv.URL+"/org/name/resolve/main/.gitattributes", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cold HEAD status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "791" {
+		t.Errorf("cold HEAD Content-Length = %q, want 791 (true file size, not the 307 message length)", got)
+	}
+}
+
+// TestColdRangeDoesNotRelayCASETag (regression B, v0.1.1): a cold ranged
+// GET on an xet file must NOT relay the CDN's CAS ETag — warm ranged HITs
+// serve the sha256, and a cold/warm ETag flip makes persistent-local_dir
+// clients re-download. The cold range answer carries no ETag when the
+// truth (sha256) is unavailable on that hop.
+func TestColdRangeDoesNotRelayCASETag(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.xetMode = true
+	body := []byte("0123456789abcdefghij")
+	sum := addFile(t, f, "xr.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	resp, _ := proxyGet(t, srv.URL+"/org/name/resolve/main/xr.bin", map[string]string{"Range": "bytes=0-4"})
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("cold ranged GET status = %d, want 206", resp.StatusCode)
+	}
+	if et := resp.Header.Get("ETag"); strings.HasPrefix(et, `"cas-`) {
+		t.Errorf("cold ranged GET relayed CAS ETag %q — must not (warm serves sha256 %q)", et, sum)
 	}
 }
