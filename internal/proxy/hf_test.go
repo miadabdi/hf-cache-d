@@ -725,6 +725,63 @@ func TestQueryAllowlistKeysAndFetch(t *testing.T) {
 	}
 }
 
+func TestMetadataBodyLimitRejectsOversizedUpstream(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 32<<20+1))
+	}))
+	defer up.Close()
+	st := newMemStore()
+	p := New(up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+	resp, _ := proxyGet(t, srv.URL+"/api/models/org/name/revision/"+sha1, nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("oversized response = %d, want 502", resp.StatusCode)
+	}
+	if keys := st.keys(); len(keys) != 0 {
+		t.Fatalf("oversized metadata cached as %v", keys)
+	}
+}
+
+func TestOversizedCachedEnvelopeIsCorruptMiss(t *testing.T) {
+	up, _ := newFakeUpstream(t)
+	st := newMemStore()
+	key := fmt.Sprintf("pub/%s/%s/api/models/org/name/tree.json", sha1[:2], sha1)
+	oversized := append([]byte(`{"body":"`), bytes.Repeat([]byte("x"), 32<<20+1)...)
+	oversized = append(oversized, []byte(`"}`)...)
+	if err := st.Put(context.Background(), key, bytes.NewReader(oversized), int64(len(oversized))); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+	resp, _ := proxyGet(t, srv.URL+"/api/models/org/name/tree/main", nil)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Cache") != "MISS" {
+		t.Fatalf("oversized cached envelope: status %d cache %q, want 200 MISS", resp.StatusCode, resp.Header.Get("X-Cache"))
+	}
+}
+
+func TestCursorMultiplicityAndLength(t *testing.T) {
+	up, _ := newFakeUpstream(t)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+	url := srv.URL + "/api/models/org/name/tree/main?cursor=abc"
+	if resp, _ := proxyGet(t, url, nil); resp.Header.Get("X-Cache") != "MISS" {
+		t.Fatalf("single cursor = %q, want MISS", resp.Header.Get("X-Cache"))
+	}
+	if resp, _ := proxyGet(t, url+"&cursor=xyz", nil); resp.Header.Get("X-Cache") != "HIT" {
+		t.Fatalf("duplicate cursor = %q, want same canonical key", resp.Header.Get("X-Cache"))
+	}
+	if resp, _ := proxyGet(t, url+strings.Repeat("x", 1025), nil); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("long cursor = %d, want 400", resp.StatusCode)
+	}
+	if keys := st.keys(); len(keys) != 1 {
+		t.Fatalf("invalid cursors minted keys: %v", keys)
+	}
+}
+
 func TestNon404ClientErrorsNotRetried(t *testing.T) {
 	up, f := newFakeUpstream(t)
 	f.mu.Lock()

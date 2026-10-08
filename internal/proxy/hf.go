@@ -41,6 +41,9 @@ var _ storeAPI = (*store.Store)(nil)
 // refTTL is how long a floating-ref → commit mapping is trusted.
 const refTTL = 5 * time.Minute
 
+// metadataMaxBytes bounds both fetched JSON and decoded cache envelopes.
+const metadataMaxBytes = 32 << 20 // 32 MiB
+
 // Proxy serves the public metadata and file routes for one upstream.
 type Proxy struct {
 	upstream string
@@ -61,9 +64,9 @@ type Proxy struct {
 
 	// File-lane state (Task 3).
 	manMu     sync.Mutex
-	manifests map[string]*manifest.Manifest // sha or seal key -> read cache
+	manifests map[string]*manifest.Manifest // repo-scoped or seal key -> read cache
 	relMu     sync.Mutex
-	releaseMu map[string]*sync.Mutex // sha -> manifest RMW lock
+	releaseMu map[string]*sync.Mutex // repo-scoped manifest key -> RMW lock
 
 	// Sealed local models (Task 4). nil until SetLocalIndexes wires the
 	// push lane's index cache; reads then check locals BEFORE the public
@@ -117,10 +120,10 @@ func (p *Proxy) Register(mux *http.ServeMux) {
 //	pub/<sha[0:2]>/<sha>/api/models/<org>/<name>/tree.json[?<canonical query>]
 //
 // The API response is stored as a "file" under the repo path. The query
-// suffix is the canonical (sorted) encoding of the ALLOWLISTED params only
-// (see allowQuery): pagination cursors and recursive/expand/limit variants
-// get distinct keys, while unknown client params are dropped so arbitrary
-// input cannot mint permanent S3 objects.
+// suffix is the canonical (sorted) encoding of ALLOWLISTED params only.
+// Duplicate values keep the first, values above 1024 bytes and malformed
+// cursors get 400, and unknown params are dropped. Legitimate distinct
+// cursors still mint permanent keys (no-GC ceiling).
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -166,7 +169,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	// One canonical query for both the cache key and the upstream fetch:
 	// same allowlist, same ordering — a hit can never serve the wrong body.
-	q := allowQuery(r.URL.Query())
+	q, err := allowQuery(r.URL.Query())
+	if err != nil {
+		p.writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	key := fmt.Sprintf("pub/%s/%s/api/models/%s/%s.json", sha[:2], sha, repo, kind)
 	if enc := q.Encode(); enc != "" {
 		key += "?" + enc
@@ -185,19 +192,24 @@ var allowedParams = map[string]bool{
 	"limit":     true,
 }
 
-// allowQuery returns the canonical encoding (params sorted) of the
-// allowlisted subset of q, dropping everything else.
-func allowQuery(q url.Values) url.Values {
+// allowQuery canonicalizes allowlisted values. Duplicate occurrences keep
+// only the first (so they cannot mint keys); malformed/oversized values get
+// 400. Unknown parameters are dropped.
+var cursorRe = regexp.MustCompile(`^[A-Za-z0-9._~=/+\-]*$`)
+
+func allowQuery(q url.Values) (url.Values, error) {
 	out := url.Values{}
 	for k, vs := range q {
-		if !allowedParams[k] {
+		if !allowedParams[k] || len(vs) == 0 {
 			continue
 		}
-		for _, v := range vs {
-			out.Add(k, v)
+		v := vs[0]
+		if len(v) > 1024 || (k == "cursor" && !cursorRe.MatchString(v)) {
+			return nil, fmt.Errorf("invalid %s query value", k)
 		}
+		out.Set(k, v)
 	}
-	return out
+	return out, nil
 }
 
 // cutRepo splits the path remainder after /api/models/ into the {org}/{name}
@@ -315,9 +327,11 @@ func (p *Proxy) servePinned(w http.ResponseWriter, r *http.Request, repo, sha, k
 	// bytes_pulled is counted inside fetchOnce (where the body is read);
 	// counting it here too would double every metadata miss.
 	env, _ := json.Marshal(cachedResp{Link: link, Body: string(body)})
-	if err := p.store.Put(r.Context(), key, bytes.NewReader(env), int64(len(env))); err != nil {
-		// Serving fresh data still works; only persistence failed.
-		log.Printf("store put %s: %v", key, err)
+	if len(env) <= metadataMaxBytes {
+		if err := p.store.Put(r.Context(), key, bytes.NewReader(env), int64(len(env))); err != nil {
+			// Serving fresh data still works; only persistence failed.
+			log.Printf("store put %s: %v", key, err)
+		}
 	}
 
 	p.writeBody(w, r, body, "MISS", sha, link)
@@ -334,8 +348,13 @@ func (p *Proxy) readCached(ctx context.Context, key string) (body []byte, link s
 		return nil, "", false
 	}
 	defer rc.Close()
+	// Bound the encoded object as well as its decoded metadata body.
+	raw, err := io.ReadAll(io.LimitReader(rc, metadataMaxBytes+1))
+	if err != nil || len(raw) > metadataMaxBytes {
+		return nil, "", false
+	}
 	var env cachedResp
-	if err := json.NewDecoder(rc).Decode(&env); err != nil || env.Body == "" {
+	if err := json.Unmarshal(raw, &env); err != nil || env.Body == "" || len(env.Body) > metadataMaxBytes {
 		log.Printf("cached %s: not a valid envelope, refetching", key)
 		return nil, "", false
 	}
@@ -446,9 +465,12 @@ func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byt
 	case resp.StatusCode >= 400:
 		return nil, "", &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream error"}
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, metadataMaxBytes+1))
 	if err != nil {
 		return nil, "", &upstreamError{status: http.StatusBadGateway, msg: "upstream read error"}
+	}
+	if len(body) > metadataMaxBytes {
+		return nil, "", &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream metadata too large"}
 	}
 	p.m.AddBytesPulled(int64(len(body)))
 	return body, resp.Header.Get("Link"), nil
