@@ -162,17 +162,18 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 	// needs a seekable body (payload checksum), but the request body is not
 	// seekable, so use the multipart streaming path like the file lane's
 	// tee-through upload. The store goroutine closes the pipe reader on ALL
-	// exits so a Put failure before consuming the body cannot deadlock the
-	// handler's writes.
+	// exits — including a Put that returns nil early WITHOUT draining the
+	// body — so the handler's writes always surface (EPIPE), never block.
 	pr, pw := io.Pipe()
 	hash := sha256.New()
 	putDone := make(chan error, 1)
 	go func() {
-		err := l.store.Put(r.Context(), key, pr, -1)
-		if err != nil {
-			pr.CloseWithError(err)
-		}
-		putDone <- err
+		var perr error
+		defer func() {
+			pr.CloseWithError(perr) // nil error still closes: writers unblock
+			putDone <- perr
+		}()
+		perr = l.store.Put(r.Context(), key, pr, -1)
 	}()
 	if _, err := io.Copy(io.MultiWriter(pw, hash), io.LimitReader(r.Body, r.ContentLength)); err != nil {
 		pw.CloseWithError(err)
@@ -330,15 +331,15 @@ func (l *Lane) handleSeal(w http.ResponseWriter, r *http.Request, repo, version,
 	}
 
 	// Index update: append + move main, serialized repo-wide so concurrent
-	// seals of different versions cannot lose each other's entries. A
-	// failure here is reported (500), never claimed complete; recovery is
-	// re-POST (see above).
-	next, err := l.updatedIndex(r.Context(), repo, version, commit)
-	if err != nil {
+	// seals of different versions cannot lose each other's entries — the
+	// store read-modify-write AND the in-process cache install happen inside
+	// one critical section, so a later-finishing seal can never install a
+	// staler index than one already installed. A failure here is reported
+	// (500), never claimed complete; recovery is re-POST (see above).
+	if err := l.commitIndex(r.Context(), repo, version, commit); err != nil {
 		writeErr(w, http.StatusInternalServerError, "sealed but index update failed; re-post manifest to recover")
 		return
 	}
-	l.index.Refresh(repo, next)
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"version": version,
@@ -366,12 +367,14 @@ func (l *Lane) isSealed(ctx context.Context, repo, version string) (bool, error)
 	return exists, err
 }
 
-// updatedIndex loads the repo index from the store, appends the newly sealed
-// version (ordered by seal time, main = latest), writes it back and returns
-// it. The repo-level index lock serializes the read-modify-write across
-// versions: two seals of different versions in one repo cannot interleave
-// and lose an entry. The caller separately holds the version lock.
-func (l *Lane) updatedIndex(ctx context.Context, repo, version, commit string) (*local.Index, error) {
+// commitIndex performs the durable index update for a seal: under the
+// repo-level index lock, read the index from the store, append the newly
+// sealed version, write it back, and install the result in the in-process
+// cache — all inside the SAME critical section. Lock ordering matters: a
+// seal whose store write completes late still installs under the lock, so
+// it reads (and therefore extends) whatever the earlier finisher wrote and
+// the cached view can never regress to a staler index.
+func (l *Lane) commitIndex(ctx context.Context, repo, version, commit string) error {
 	mu := l.muForRepo(repo)
 	mu.Lock()
 	defer mu.Unlock()
@@ -402,13 +405,14 @@ func (l *Lane) updatedIndex(ctx context.Context, repo, version, commit string) (
 
 	body, err := json.Marshal(idx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	ikey := local.IndexKey(repo)
 	if err := l.store.Put(ctx, ikey, strings.NewReader(string(body)), int64(len(body))); err != nil {
-		return nil, err
+		return err
 	}
-	return idx, nil
+	l.index.Refresh(repo, idx) // inside the lock: see commitIndex doc
+	return nil
 }
 
 // readStoreIndex re-reads the repo index from the store (bypasses the cache:

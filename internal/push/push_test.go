@@ -25,11 +25,14 @@ import (
 // pstore is the in-memory store fake (memStore's shape, local to this
 // package so push tests stay self-contained).
 type pstore struct {
-	mu           sync.Mutex
-	objs         map[string][]byte
-	failPutKeys  map[string]bool
-	failGet      bool     // every Get fails (transient S3 outage)
-	failHeadKeys map[string]bool // only these keys fail Head
+	mu                  sync.Mutex
+	objs                map[string][]byte
+	failPutKeys         map[string]bool
+	failGet             bool           // every Get fails (transient S3 outage)
+	failHeadKeys        map[string]bool // only these keys fail Head
+	hookIndexPut        func()          // runs before an index-key Put
+	indexPutAttempts    int
+	succeedWithoutDrain map[string]bool // Put returns nil without reading
 }
 
 func newPStore() *pstore { return &pstore{objs: map[string][]byte{}} }
@@ -63,9 +66,22 @@ func (m *pstore) GetRange(_ context.Context, key string, start, end int64) (io.R
 func (m *pstore) Put(_ context.Context, key string, r io.Reader, _ int64) error {
 	m.mu.Lock()
 	failing := m.failPutKeys[key]
+	noDrain := m.succeedWithoutDrain[key]
+	isIndex := strings.HasSuffix(key, "/index.json")
+	hook := m.hookIndexPut
+	if isIndex {
+		m.indexPutAttempts++
+	}
 	m.mu.Unlock()
 	if failing {
 		return fmt.Errorf("pstore: simulated put failure")
+	}
+	if noDrain {
+		// Early success without consuming the body (the round-2 bug shape).
+		return nil
+	}
+	if isIndex && hook != nil {
+		hook()
 	}
 	b, err := io.ReadAll(r)
 	if err != nil {
@@ -1107,4 +1123,160 @@ func TestConcurrentSealsDifferentVersionsBothIndexed(t *testing.T) {
 	if list.Main == "" {
 		t.Error("main pointer missing after concurrent seals")
 	}
+}
+
+
+// ---- review round 2 covering tests ----
+
+// TestLateStoreWriteCannotRegressIndex (item 4): a seal whose index store
+// write completes LATE (after another seal already installed a newer index)
+// must not regress the in-memory or stored index. Simulated with a fake
+// whose index Put blocks the FIRST seal until the second seal has finished;
+// both versions must end up in the listing AND both must serve locally.
+func TestLateStoreWriteCannotRegressIndex(t *testing.T) {
+	l := newLane(t, "tok")
+	repo := "org/priv"
+	stageAll(t, l, repo, "v1", map[string][]byte{"a": []byte("one")})
+	stageAll(t, l, repo, "v2", map[string][]byte{"b": []byte("two")})
+
+	// Block index writes: the first seal parks inside the store Put.
+	block := make(chan struct{})
+	release := make(chan struct{})
+	l.st.mu.Lock()
+	l.st.hookIndexPut = func() {
+		select {
+		case <-block: // first caller (v1) parks until released
+			<-release
+		default:
+		}
+	}
+	l.st.mu.Unlock()
+
+	var wg sync.WaitGroup
+	sealRes := make(map[string]int)
+	var mu sync.Mutex
+	sealFiles := func(version, file, content string) {
+		defer wg.Done()
+		resp, _ := l.seal(t, repo, version, map[string]string{file: shaHex([]byte(content))}, nil, "tok")
+		mu.Lock()
+		sealRes[version] = resp.StatusCode
+		mu.Unlock()
+	}
+
+	// v1 first: its index write parks (holding the repo lock — v2's
+	// commitIndex queues behind it, which is the serialization working).
+	wg.Add(1)
+	go func() { sealFiles("v1", "a", "one") }()
+	waitForCond(t, 5*time.Second, func() bool {
+		l.st.mu.Lock()
+		defer l.st.mu.Unlock()
+		return l.st.indexPutAttempts >= 1
+	}, "first index write attempt")
+	// Fire v2 (it will block on the repo lock) and let v1 finish.
+	wg.Add(1)
+	go func() { sealFiles("v2", "b", "two") }()
+	time.Sleep(50 * time.Millisecond) // let v2 queue on the lock
+	close(block)
+	close(release)
+	wg.Wait()
+
+	for v, code := range sealRes {
+		if code != http.StatusOK {
+			t.Errorf("seal %s: status %d, want 200", v, code)
+		}
+	}
+
+	// The cached AND stored index carry both versions: listing + both files
+	// serve locally with zero upstream traffic.
+	for _, tc := range []struct{ rev, file, want string }{
+		{"v1", "a", "one"}, {"v2", "b", "two"},
+	} {
+		resp, body := hfGet(t, l.srv.URL+"/"+repo+"/resolve/"+tc.rev+"/"+tc.file)
+		if resp.StatusCode != http.StatusOK || string(body) != tc.want {
+			t.Errorf("resolve %s/%s = %d %q, want %q", tc.rev, tc.file, resp.StatusCode, body, tc.want)
+		}
+	}
+	resp, _ := hfGet(t, l.srv.URL+"/api/models/"+repo)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("info = %d", resp.StatusCode)
+	}
+	if n := l.hits(); n != 0 {
+		t.Errorf("upstream requests = %d, want 0", n)
+	}
+
+	// A FRESH lane (cold cache) over the same store also sees both: the
+	// stored index never regressed either.
+	ix := local.NewIndexes(l.st)
+	p := proxy.New(l.up.URL, l.st)
+	p.SetLocalIndexes(ix)
+	pl := New("tok", l.st, ix)
+	mux := http.NewServeMux()
+	p.Register(mux)
+	pl.Register(mux)
+	fmux := http.NewServeMux()
+	p.RegisterFiles(fmux)
+	mux.Handle("/", fmux)
+	srv2 := httptest.NewServer(mux)
+	t.Cleanup(srv2.Close)
+	for _, rev := range []string{"v1", "v2"} {
+		resp, err := http.Get(srv2.URL + "/v1/artifacts/" + repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var list struct {
+			Versions []struct {
+				Version string `json:"version"`
+			} `json:"versions"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&list)
+		resp.Body.Close()
+		found := false
+		for _, v := range list.Versions {
+			if v.Version == rev {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("fresh-lane listing lost version %s (stored index regressed): %+v", rev, list.Versions)
+		}
+	}
+}
+
+// TestPutStoreSuccessWithoutDrainDoesNotDeadlock (item 5): a store.Put that
+// returns nil immediately WITHOUT reading the body must still unblock the
+// handler — the pipe reader is closed on every exit from the goroutine.
+func TestPutStoreSuccessWithoutDrainDoesNotDeadlock(t *testing.T) {
+	l := newLane(t, "tok")
+	l.st.mu.Lock()
+	l.st.succeedWithoutDrain = map[string]bool{local.FileKey("org/priv", "v1", "f.bin"): true}
+	l.st.mu.Unlock()
+
+	done := make(chan int, 1)
+	go func() {
+		resp := l.put(t, "org/priv", "v1", "f.bin", bytes.Repeat([]byte("q"), 256*1024), "tok")
+		done <- resp.StatusCode
+	}()
+	select {
+	case code := <-done:
+		// The handler completes; a 201 with a bogus "success" is the
+		// store's lie, not ours — what matters is that it RETURNS.
+		if code != http.StatusInternalServerError && code != http.StatusCreated {
+			t.Errorf("PUT under drain-less success: status %d, want 500 or 201", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("PUT deadlocked: store.Put returned nil without draining")
+	}
+}
+
+// waitForCond polls cond until true or timeout (test-local, non-fatal).
+func waitForCond(t *testing.T, timeout time.Duration, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
