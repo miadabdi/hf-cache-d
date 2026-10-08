@@ -93,7 +93,8 @@ func TestMetricsFileColdThenWarm(t *testing.T) {
 		t.Fatalf("cold GET X-Cache=%q body=%q", resp.Header.Get("X-Cache"), got)
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return st.has(fileKey(sha1, "org/name", "m.bin"))
+		files := readFileManifest(t, st, sha1)
+		return st.has(fileKey(sha1, "org/name", "m.bin")) && files["m.bin"] != ""
 	}, "object stored")
 	if miss := countOf(t, c, "hf_cache_misses_total"); miss != "1" {
 		t.Errorf("misses after cold GET = %s, want 1", miss)
@@ -147,13 +148,11 @@ func TestMetricsVanishedObjectNoFalseHit(t *testing.T) {
 	}
 }
 
-// TestMetricsNon200ColdGetOneMiss: a non-200 cold GET that relays upstream's
-// status must count exactly ONE miss (not one in serveGetMiss and another in
-// the relay).
-func TestMetricsNon200ColdGetOneMiss(t *testing.T) {
+// TestMetricsColdRange416OneMiss: a cold ranged GET relaying upstream's
+// 416 counts exactly one miss (not one in serveGetMiss and one in relay).
+func TestMetricsColdRange416OneMiss(t *testing.T) {
 	up, f := newFakeUpstream(t)
-	// A file whose cold fetch upstream returns non-200: use an upstream 416
-	// on a ranged cold GET — serveGetMiss routes it to the range relay.
+	// A cold ranged GET gets upstream 416 through relayColdRange.
 	addFile(t, f, "r16.bin", []byte("range sixteen bytes"))
 	st := newMemStore()
 	p, c := newCountedProxy(t, up.URL, st)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -23,7 +24,11 @@ func fileKey(sha, repo, file string) string {
 }
 
 func manifestKey(sha string) string {
-	return fmt.Sprintf("pub/%s/%s/manifest.json", sha[:2], sha)
+	return manifestKeyFor("org/name", sha)
+}
+
+func manifestKeyFor(repo, sha string) string {
+	return fmt.Sprintf("pub/%s/%s/%s/manifest.json", sha[:2], sha, repo)
 }
 
 // addFile installs a file in the fake upstream and returns its sha256 hex.
@@ -729,7 +734,7 @@ func TestDetachedFetchOutlivesClientTimeout(t *testing.T) {
 func TestVanishedObjectSelfHeals(t *testing.T) {
 	up, f := newFakeUpstream(t)
 	body := []byte("0123456789abcdef")
-	addFile(t, f, "v.bin", body)
+	sum := addFile(t, f, "v.bin", body)
 	st := newMemStore()
 	p, _ := newTestProxy(t, up.URL, st)
 	srv := newTestServer(p)
@@ -761,6 +766,9 @@ func TestVanishedObjectSelfHeals(t *testing.T) {
 	if got := resp.Header.Get("Content-Length"); got != fmt.Sprint(len(body)) {
 		t.Errorf("vanished-object HEAD Content-Length = %q, want %d (upstream truth)", got, len(body))
 	}
+	if got := resp.Header.Get("ETag"); got == `"`+sum+`"` {
+		t.Errorf("vanished-object HEAD kept stale sealed ETag %q", got)
+	}
 
 	// A GET now re-populates the vanished object (HEAD never caches).
 	resp2, got2 := proxyGet(t, srv.URL+"/org/name/resolve/main/v.bin", nil)
@@ -771,8 +779,9 @@ func TestVanishedObjectSelfHeals(t *testing.T) {
 		t.Errorf("re-populating body = %q", got2)
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return st.has(key)
-	}, "re-populated object")
+		files := readFileManifest(t, st, sha1)
+		return st.has(key) && files["v.bin"] != ""
+	}, "re-populated manifest entry")
 	resp3, _ := proxyGet(t, srv.URL+"/org/name/resolve/main/v.bin", nil)
 	if resp3.Header.Get("X-Cache") != "HIT" {
 		t.Fatalf("post-repopulation GET X-Cache = %q, want HIT", resp3.Header.Get("X-Cache"))
@@ -791,6 +800,40 @@ func TestVanishedObjectSelfHeals(t *testing.T) {
 	}
 	if xc := resp4.Header.Get("X-Cache"); xc != "MISS" {
 		t.Errorf("vanished-object ranged GET X-Cache = %q, want MISS", xc)
+	}
+	if et := resp4.Header.Get("ETag"); et == `"`+sum+`"` {
+		t.Errorf("vanished ranged GET retained stale sealed ETag %q", et)
+	}
+}
+
+func TestForksWithSameCommitKeepSeparateManifests(t *testing.T) {
+	sha := sha1
+	st := newMemStore()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/revision/main") {
+			_, _ = fmt.Fprintf(w, `{"sha":%q}`, sha)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/fork-a/") {
+			_, _ = io.WriteString(w, "alpha")
+			return
+		}
+		_, _ = io.WriteString(w, "bravo")
+	}))
+	defer up.Close()
+	p := New(up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+	for _, tc := range []struct{ repo, body string }{{"org/fork-a", "alpha"}, {"org/fork-b", "bravo"}} {
+		url := srv.URL + "/" + tc.repo + "/resolve/main/weights.bin"
+		if resp, got := proxyGet(t, url, nil); resp.StatusCode != http.StatusOK || string(got) != tc.body {
+			t.Fatalf("cold %s: %d %q", tc.repo, resp.StatusCode, got)
+		}
+		key := manifestKeyFor(tc.repo, sha)
+		waitFor(t, 5*time.Second, func() bool { return st.has(key) }, "fork manifest")
+		if resp, got := proxyGet(t, url, nil); resp.Header.Get("X-Cache") != "HIT" || string(got) != tc.body {
+			t.Fatalf("warm %s: cache %q bytes %q, want HIT %q", tc.repo, resp.Header.Get("X-Cache"), got, tc.body)
+		}
 	}
 }
 

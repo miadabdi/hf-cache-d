@@ -75,11 +75,36 @@ func (m *memStore) corrupt(key string, body []byte) {
 	m.objs[key] = body
 }
 
+func TestVanishedSealedObjectDoesNotLogHit(t *testing.T) {
+	st := newMemStore()
+	sha := goodSHA
+	body := []byte("sealed bytes")
+	sum := sha256.Sum256(body)
+	key := fmt.Sprintf("pub/%s/%s/org/name/f.bin", sha[:2], sha)
+	putManifest(t, st, sha, map[string]string{"f.bin": hex.EncodeToString(sum[:])})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer up.Close()
+	previous := metrics.Default
+	metrics.Default = &metrics.Counters{}
+	defer func() { metrics.Default = previous }()
+	mux, _ := newMuxAny(up.URL, "", st)
+	var lines bytes.Buffer
+	wrapped := logMiddleware(&metrics.Counters{}, log.New(&lines, "", 0))(mux)
+	req := httptest.NewRequest(http.MethodHead, "/org/name/resolve/"+sha+"/f.bin", nil)
+	resp := httptest.NewRecorder()
+	wrapped.ServeHTTP(resp, req)
+	if strings.Contains(lines.String(), "cache=HIT") || resp.Header().Get("X-Cache") == "HIT" || resp.Header().Get("ETag") != "" {
+		t.Fatalf("vanished object %s advertised hit: headers %v log %q", key, resp.Header(), lines.String())
+	}
+}
+
 // putManifest installs a release manifest for sha with file sums.
 func putManifest(t *testing.T, st *memStore, sha string, files map[string]string) {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"identity": "hf:org/name@" + sha, "files": files})
-	if err := st.Put(context.Background(), fmt.Sprintf("pub/%s/%s/manifest.json", sha[:2], sha), bytes.NewReader(body), int64(len(body))); err != nil {
+	if err := st.Put(context.Background(), fmt.Sprintf("pub/%s/%s/org/name/manifest.json", sha[:2], sha), bytes.NewReader(body), int64(len(body))); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -163,7 +188,7 @@ func TestIntegrityCheckCriticalOnCorruption(t *testing.T) {
 	logger := log.New(&buf, "", 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/manifest.json", goodSHA[:2], goodSHA)}}, logger, 50*time.Millisecond)
+	go runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/org/name/manifest.json", goodSHA[:2], goodSHA)}}, logger, 50*time.Millisecond)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for !strings.Contains(buf.String(), "CRITICAL: integrity mismatch") && time.Now().Before(deadline) {
@@ -217,7 +242,7 @@ func TestIntegrityCheckCleanPassNoOutput(t *testing.T) {
 
 	var buf syncBuffer
 	logger := log.New(&buf, "", 0)
-	if err := checkOneManifest(context.Background(), st, logger, fmt.Sprintf("pub/%s/%s/manifest.json", goodSHA[:2], goodSHA)); err != nil {
+	if err := checkOneManifest(context.Background(), st, logger, fmt.Sprintf("pub/%s/%s/org/name/manifest.json", goodSHA[:2], goodSHA)); err != nil {
 		t.Fatalf("checkOneManifest: %v", err)
 	}
 	if buf.Len() != 0 {
@@ -235,7 +260,7 @@ func TestIntegrityCheckJoinsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/manifest.json", goodSHA[:2], goodSHA)}}, logger, 20*time.Millisecond)
+		runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/org/name/manifest.json", goodSHA[:2], goodSHA)}}, logger, 20*time.Millisecond)
 		close(done)
 	}()
 	// Let at least one tick+pass run, then cancel.

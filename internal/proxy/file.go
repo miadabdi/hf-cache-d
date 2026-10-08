@@ -53,7 +53,7 @@ func (p *Proxy) RegisterFiles(mux *http.ServeMux) {
 // S3 key layout (documented contract):
 //
 //	pub/<sha[0:2]>/<sha>/<repo>/<file>   file body
-//	pub/<sha[0:2]>/<sha>/manifest.json   release manifest (Files: path → sha256)
+//	pub/<sha[0:2]>/<sha>/<repo>/manifest.json   release manifest (Files: path → sha256)
 //
 // A file counts as cached only when its manifest entry exists: an S3 object
 // without a manifest entry is a partial or aborted upload and is never
@@ -92,7 +92,7 @@ func (p *Proxy) handleResolveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sum, size, ok := p.fileEntry(r.Context(), sha, file); ok {
+	if sum, size, ok := p.fileEntry(r.Context(), repo, sha, file); ok {
 		key := fileKeyOf(sha, repo, file)
 		p.serveHit(w, r, repo, sha, file, key, sum, size,
 			func() { p.serveHeadMiss(w, r, repo, sha, file) },
@@ -111,9 +111,9 @@ func fileKeyOf(sha, repo, file string) string {
 	return fmt.Sprintf("pub/%s/%s/%s/%s", sha[:2], sha, repo, file)
 }
 
-// manifestKeyOf builds the manifest object key for a commit sha.
-func manifestKeyOf(sha string) string {
-	return fmt.Sprintf("pub/%s/%s/manifest.json", sha[:2], sha)
+// manifestKeyOf builds the repo-scoped manifest and cache identity.
+func manifestKeyOf(repo, sha string) string {
+	return fmt.Sprintf("pub/%s/%s/%s/manifest.json", sha[:2], sha, repo)
 }
 
 // validFilePath enforces the file-lane shape: [A-Za-z0-9._/-]+, no "..", no
@@ -147,9 +147,10 @@ func validFilePath(file string) bool {
 // are not cached negatively: each cold request costs one manifest read.
 // ponytail: single-process read cache; a second proxy instance would need
 // to drop it (or add store-side versioning) to stay coherent.
-func (p *Proxy) fileEntry(ctx context.Context, sha, file string) (sum string, size int64, ok bool) {
+func (p *Proxy) fileEntry(ctx context.Context, repo, sha, file string) (sum string, size int64, ok bool) {
+	identity := manifestKeyOf(repo, sha)
 	p.manMu.Lock()
-	m, cached := p.manifests[sha]
+	m, cached := p.manifests[identity]
 	if cached {
 		defer p.manMu.Unlock()
 		sum, ok = m.Files[file]
@@ -162,11 +163,11 @@ func (p *Proxy) fileEntry(ctx context.Context, sha, file string) (sum string, si
 
 	// Cache miss: load from the store, then install without clobbering a
 	// concurrently-installed newer entry.
-	m = p.loadManifest(ctx, sha)
+	m = p.loadManifest(ctx, identity)
 	if m == nil {
 		return "", 0, false
 	}
-	m = p.installIfNewer(sha, m)
+	m = p.installIfNewer(identity, m)
 	p.manMu.Lock()
 	defer p.manMu.Unlock()
 	sum, ok = m.Files[file]
@@ -176,33 +177,33 @@ func (p *Proxy) fileEntry(ctx context.Context, sha, file string) (sum string, si
 	return sum, m.Sizes[file], true
 }
 
-// loadManifest reads manifest.json for sha from the store and returns it
+// loadManifest reads a repo-scoped manifest from the store and returns it
 // WITHOUT caching (the caller decides). A missing or corrupt manifest
 // yields nil (self-heals on next publish). The S3 read happens outside
 // manMu; installIfNewer below serializes the install against concurrent
 // publishers so a stale read can never overwrite a newer cached manifest.
-func (p *Proxy) loadManifest(ctx context.Context, sha string) *manifest.Manifest {
-	rc, _, err := p.store.Get(ctx, manifestKeyOf(sha))
+func (p *Proxy) loadManifest(ctx context.Context, identity string) *manifest.Manifest {
+	rc, _, err := p.store.Get(ctx, identity)
 	if err != nil {
 		return nil
 	}
 	defer rc.Close()
 	var m manifest.Manifest
 	if err := json.NewDecoder(rc).Decode(&m); err != nil || m.Files == nil {
-		log.Printf("manifest for %s not valid, treating as absent", sha)
+		log.Printf("manifest for %s not valid, treating as absent", identity)
 		return nil
 	}
-	m.CacheKey = manifestKeyOf(sha)
+	m.CacheKey = identity
 	return &m
 }
 
-// installIfNewer caches m for sha unless a manifest with a superset of
+// installIfNewer caches m for its repo-scoped key unless a manifest with a superset of
 // entries is already cached (a concurrent publish won the race). Returns
 // the manifest the cache now holds.
-func (p *Proxy) installIfNewer(sha string, m *manifest.Manifest) *manifest.Manifest {
+func (p *Proxy) installIfNewer(identity string, m *manifest.Manifest) *manifest.Manifest {
 	p.manMu.Lock()
 	defer p.manMu.Unlock()
-	if cur, ok := p.manifests[sha]; ok {
+	if cur, ok := p.manifests[identity]; ok {
 		if cur.CacheKey == "" {
 			cur.CacheKey = m.CacheKey
 		}
@@ -222,20 +223,21 @@ func (p *Proxy) installIfNewer(sha string, m *manifest.Manifest) *manifest.Manif
 		}
 		return cur
 	}
-	p.manifests[sha] = m
+	p.manifests[identity] = m
 	return m
 }
 
-// publishFile merges file→sum (size) into the release manifest for sha.
+// publishFile merges file→sum (size) into the repo-scoped release manifest.
 // The per-release mutex serializes the store read-modify-write (the store
 // has no CAS); manMu guards the cache install, which happens only after a
 // successful store Put so a failed publish leaves no phantom entry.
 func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string, size int64) {
-	mu := p.muFor(sha)
+	identity := manifestKeyOf(repo, sha)
+	mu := p.muFor(identity)
 	mu.Lock()
 	defer mu.Unlock()
 
-	m := p.loadManifest(ctx, sha)
+	m := p.loadManifest(ctx, identity)
 	if m == nil {
 		m = &manifest.Manifest{
 			Identity: "hf:" + repo + "@" + sha,
@@ -275,26 +277,26 @@ func (p *Proxy) publishFile(ctx context.Context, repo, sha, file, sum string, si
 		log.Printf("manifest marshal %s: %v", sha, err)
 		return
 	}
-	key := manifestKeyOf(sha)
+	key := identity
 	if err := p.store.Put(ctx, key, bytes.NewReader(body), int64(len(body))); err != nil {
 		log.Printf("manifest put %s: %v", key, err)
 		return
 	}
 	next.CacheKey = key
 	p.manMu.Lock()
-	p.manifests[sha] = &next
+	p.manifests[identity] = &next
 	p.manMu.Unlock()
 }
 
-// muFor returns the in-process read-modify-write lock for one release.
-func (p *Proxy) muFor(sha string) *sync.Mutex {
+// muFor returns the in-process read-modify-write lock for one repo release.
+func (p *Proxy) muFor(identity string) *sync.Mutex {
 	p.relMu.Lock()
 	defer p.relMu.Unlock()
-	if mu, ok := p.releaseMu[sha]; ok {
+	if mu, ok := p.releaseMu[identity]; ok {
 		return mu
 	}
 	mu := &sync.Mutex{}
-	p.releaseMu[sha] = mu
+	p.releaseMu[identity] = mu
 	// ponytail: unbounded lock map, evict when release count grows.
 	return mu
 }
@@ -330,9 +332,11 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 	// first. Errors (500) count neither.
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
-	h.Set("X-Cache", "HIT")
-	h.Set("Accept-Ranges", "bytes")
-	h.Set("ETag", `"`+sum+`"`)
+	setHit := func() {
+		h.Set("X-Cache", "HIT")
+		h.Set("Accept-Ranges", "bytes")
+		h.Set("ETag", `"`+sum+`"`)
+	}
 
 	if r.Method == http.MethodHead {
 		exists, hsize, err := p.store.Head(r.Context(), key)
@@ -348,6 +352,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 		if hsize > 0 {
 			size = hsize
 		}
+		setHit()
 		p.m.AddHit()
 		h.Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
@@ -386,6 +391,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 				return
 			}
 			defer rc.Close()
+			setHit()
 			p.m.AddHit()
 			h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			h.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
@@ -407,6 +413,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 		return
 	}
 	defer rc.Close()
+	setHit()
 	p.m.AddHit()
 	h.Set("Content-Length", strconv.FormatInt(size, 10))
 	w.WriteHeader(http.StatusOK)
@@ -466,6 +473,7 @@ func (p *Proxy) serveHeadMiss(w http.ResponseWriter, r *http.Request, repo, sha,
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "MISS")
 	h.Set("Accept-Ranges", "bytes")
+	h.Del("ETag")
 	if v := firstNonEmpty(resp.Header.Get("X-Linked-ETag"), resp.Header.Get("ETag")); v != "" {
 		h.Set("ETag", v)
 	}

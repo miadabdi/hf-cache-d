@@ -54,7 +54,11 @@ func newComposeStore(t *testing.T) *store.Store {
 	}
 	conn, err := net.DialTimeout("tcp", hostport, 2*time.Second)
 	if err != nil {
-		t.Skipf("S3 endpoint %s not reachable (start with: docker compose up -d && ./scripts/dev-s3.sh): %v", endpoint, err)
+		msg := fmt.Sprintf("S3 endpoint %s not reachable (start compose first): %v", endpoint, err)
+		if os.Getenv("S3_TEST_STRICT") == "1" {
+			t.Fatal(msg)
+		}
+		t.Skip(msg)
 	}
 	conn.Close()
 
@@ -65,7 +69,11 @@ func newComposeStore(t *testing.T) *store.Store {
 	// Reachable but wrong owner (foreign SeaweedFS squatting the port)
 	// surfaces as a non-NotFound error: skip with instructions.
 	if _, _, err := st.Get(context.Background(), "auth-probe"); err != nil && !errors.Is(err, store.ErrNotFound) {
-		t.Skipf("S3 endpoint %s reachable but not usable with fixture creds (expected when another SeaweedFS owns the port; fix with: docker compose down && SEAWEEDFS_S3_PORT=8333 docker compose up -d && ./scripts/dev-s3.sh): %v", endpoint, err)
+		msg := fmt.Sprintf("S3 endpoint %s reachable but not usable with fixture creds: %v", endpoint, err)
+		if os.Getenv("S3_TEST_STRICT") == "1" {
+			t.Fatal(msg)
+		}
+		t.Skip(msg)
 	}
 	return st
 }
@@ -113,10 +121,8 @@ func TestProxyAgainstRealStore(t *testing.T) {
 func TestFileLaneAgainstRealStore(t *testing.T) {
 	up, f := newFakeUpstream(t)
 	f.setRepo(fmt.Sprintf("org/name-%d", time.Now().UnixNano()))
-	// Unique commit sha per run: packages under ./... run in parallel
-	// against one shared bucket, and the manifest key carries only the sha
-	// (a commit sha identifies one repo in reality), so fixtures must not
-	// share one either.
+	// Unique commit sha per run so files and metadata never start cache-warm
+	// against the shared compose bucket.
 	uniq := sha256.Sum256([]byte(f.repoOf()))
 	sha := hex.EncodeToString(uniq[:20]) // 40-hex, the commit shape
 	f.mu.Lock()
@@ -148,7 +154,7 @@ func TestFileLaneAgainstRealStore(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	var files map[string]string
 	for time.Now().Before(deadline) {
-		rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/manifest.json", sha[:2], sha))
+		rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/%s/manifest.json", sha[:2], sha, repo))
 		if err == nil {
 			var m struct {
 				Files map[string]string `json:"files"`

@@ -142,12 +142,20 @@ func newComposeStore(t *testing.T) *store.Store {
 	}
 	hostport := strings.TrimPrefix(strings.TrimPrefix(s3Endpoint(), "http://"), "https://")
 	if conn, err := net.DialTimeout("tcp", hostport, 2*time.Second); err != nil {
-		t.Skipf("S3 endpoint %s not reachable (docker compose up -d && ./scripts/dev-s3.sh): %v", s3Endpoint(), err)
+		msg := fmt.Sprintf("S3 endpoint %s not reachable (docker compose up -d && ./scripts/dev-s3.sh): %v", s3Endpoint(), err)
+		if os.Getenv("S3_TEST_STRICT") == "1" {
+			t.Fatal(msg)
+		}
+		t.Skip(msg)
 	} else {
 		conn.Close()
 	}
 	if _, _, err := st.Get(context.Background(), "auth-probe"); err != nil && !errors.Is(err, store.ErrNotFound) {
-		t.Skipf("S3 endpoint %s reachable but not usable with fixture creds: %v", s3Endpoint(), err)
+		msg := fmt.Sprintf("S3 endpoint %s reachable but not usable with fixture creds: %v", s3Endpoint(), err)
+		if os.Getenv("S3_TEST_STRICT") == "1" {
+			t.Fatal(msg)
+		}
+		t.Skip(msg)
 	}
 	return st
 }
@@ -241,7 +249,7 @@ func barrier(t *testing.T, st *store.Store, sha, repo string, files map[string][
 	for name, sum := range sums {
 		ok := false
 		for time.Now().Before(deadline) {
-			rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/manifest.json", sha[:2], sha))
+			rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/%s/manifest.json", sha[:2], sha, repo))
 			if err == nil {
 				var m struct {
 					Files map[string]string `json:"files"`

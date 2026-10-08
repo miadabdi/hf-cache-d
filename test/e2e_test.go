@@ -99,7 +99,7 @@ func TestSnapshotSequenceE2E(t *testing.T) {
 	}
 
 	// Manifest durable and correct.
-	rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/manifest.json", f.sha[:2], f.sha))
+	rc, _, err := st.Get(context.Background(), fmt.Sprintf("pub/%s/%s/%s/manifest.json", f.sha[:2], f.sha, repo))
 	if err != nil {
 		t.Fatalf("manifest get: %v", err)
 	}
