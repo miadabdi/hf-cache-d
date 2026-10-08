@@ -120,6 +120,7 @@ func newMuxAny(upstream, pushToken string, st muxStore) (http.Handler, *proxy.Pr
 	mux.HandleFunc("/metricsz", handleMetricsz)
 	p.Register(mux)  // /api/models/
 	pl.Register(mux) // /v1/artifacts/
+	mux.HandleFunc("/api/whoami-v2", handleWhoamiV2)
 	files := http.NewServeMux()
 	p.RegisterFiles(files)
 	mux.Handle("/", files)
@@ -145,6 +146,25 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version})
+}
+
+// handleWhoamiV2 answers GET /api/whoami-v2 with an honest stub: reads are
+// anonymous (trusted-network design), tokens are never validated, so the
+// response says exactly that. Token-validating tooling (huggingface-cli
+// login/whoami, HfApi.whoami) gets a well-formed answer instead of a 404.
+func handleWhoamiV2(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"type": "user",
+		"name": "anonymous",
+		"auth": map[string]any{
+			"accessToken": map[string]any{"role": "read"},
+		},
+	})
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {

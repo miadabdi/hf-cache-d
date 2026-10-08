@@ -72,6 +72,10 @@ type Proxy struct {
 	relMu     sync.Mutex
 	releaseMu map[string]*sync.Mutex // repo-scoped manifest key -> RMW lock
 
+	// Singleflight state: one upstream transfer per object key.
+	sfMu     sync.Mutex
+	inflight map[string]chan struct{} // object key -> closed when transfer done
+
 	// Sealed local models (Task 4). nil until SetLocalIndexes wires the
 	// push lane's index cache; reads then check locals BEFORE the public
 	// flow (the shadowing rule).
@@ -408,12 +412,29 @@ func (p *Proxy) writeErr(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// writeErrCode is writeErr with an HF-compatible X-Error-Code header: stock
+// huggingface_hub raises typed exceptions (RepositoryNotFoundError,
+// EntryNotFoundError) from these codes; without them every 404 is untyped.
+func (p *Proxy) writeErrCode(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("X-Error-Code", code)
+	p.writeErr(w, status, msg)
+}
+
 // fail maps internal errors onto client-facing statuses: upstream failures
-// keep their mapped status, anything else is a 500 without detail.
+// keep their mapped status, anything else is a 500 without detail. Legit
+// 404s count as not-found, never as errors, so routine misses cannot bury
+// real failures in upstream_errors_total.
 func (p *Proxy) fail(w http.ResponseWriter, err error) {
 	var ue *upstreamError
 	if errors.As(err, &ue) {
-		p.m.AddUpstreamError()
+		if ue.status == http.StatusNotFound {
+			p.m.AddUpstreamNotFound()
+		} else {
+			p.m.AddUpstreamError()
+		}
+		if ue.code != "" {
+			w.Header().Set("X-Error-Code", ue.code)
+		}
 		p.writeErr(w, ue.status, ue.msg)
 		return
 	}
@@ -423,11 +444,13 @@ func (p *Proxy) fail(w http.ResponseWriter, err error) {
 
 // upstreamError carries a client-facing status for upstream failures, plus
 // the upstream's real HTTP status (0 for connection-level failures) so the
-// retry policy can distinguish 5xx (retry) from 4xx (never retry).
+// retry policy can distinguish 5xx (retry) from 4xx (never retry). code is
+// the HF-compatible X-Error-Code for 404s (RepoNotFound/EntryNotFound).
 type upstreamError struct {
 	status   int // client-facing status
 	upstream int // real upstream status, 0 = connection failure
 	msg      string
+	code     string // X-Error-Code, set on 404s
 }
 
 func (e *upstreamError) Error() string { return e.msg }
@@ -476,7 +499,7 @@ func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values) ([]byt
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream"}
+		return nil, "", &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream", code: "RepoNotFound"}
 	case resp.StatusCode >= 400:
 		return nil, "", &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream error"}
 	}

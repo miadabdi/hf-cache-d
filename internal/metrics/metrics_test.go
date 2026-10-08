@@ -11,7 +11,7 @@ import (
 // counter sample or HELP/TYPE directive.
 var (
 	helpRe  = regexp.MustCompile(`^# (HELP|TYPE) hf_cache_[a-z_]+ .+$`)
-	lineRe  = regexp.MustCompile(`^hf_cache_(requests_total\{route="[a-z]+"\}|hits_total|misses_total|upstream_errors_total|bytes_served_total|bytes_pulled_total) [0-9]+$`)
+	lineRe  = regexp.MustCompile(`^hf_cache_(requests_total\{route="[a-z]+"\}|hits_total|misses_total|upstream_errors_total|upstream_not_found_total|bytes_served_total|bytes_pulled_total) [0-9]+$`)
 	namesRe = regexp.MustCompile(`(?m)^# TYPE (hf_cache_[a-z_]+) counter$`)
 )
 
@@ -24,6 +24,8 @@ func TestRenderIsPrometheusText(t *testing.T) {
 	c.AddMiss()
 	c.AddMiss()
 	c.AddUpstreamError()
+	c.AddUpstreamNotFound()
+	c.AddUpstreamNotFound()
 	c.AddBytesServed(2048)
 	c.AddBytesPulled(1048576)
 	out := c.Render()
@@ -39,6 +41,7 @@ func TestRenderIsPrometheusText(t *testing.T) {
 		"hf_cache_hits_total 1",
 		"hf_cache_misses_total 2",
 		"hf_cache_upstream_errors_total 1",
+		"hf_cache_upstream_not_found_total 2",
 		"hf_cache_bytes_served_total 2048",
 		"hf_cache_bytes_pulled_total 1048576",
 	} {
@@ -58,8 +61,8 @@ func TestEveryTypedMetricHasCounterType(t *testing.T) {
 	for _, m := range regexp.MustCompile(`^(hf_cache_[a-z_]+)[ {]`).FindAllStringSubmatch(out, -1) {
 		samples[m[1]] = true
 	}
-	if len(typed) != 6 {
-		t.Errorf("typed metrics = %v, want 6", typed)
+	if len(typed) != 7 {
+		t.Errorf("typed metrics = %v, want 7", typed)
 	}
 	for name := range samples {
 		if !typed[name] {

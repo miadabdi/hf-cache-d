@@ -38,6 +38,7 @@ type Counters struct {
 	hits         atomic.Uint64
 	misses       atomic.Uint64
 	upstreamErrs atomic.Uint64
+	upstream404s atomic.Uint64
 	bytesServed  atomic.Int64
 	bytesPulled  atomic.Int64
 }
@@ -65,6 +66,11 @@ func (c *Counters) AddMiss() { c.misses.Add(1) }
 
 // AddUpstreamError counts one failed (post-retry) upstream fetch.
 func (c *Counters) AddUpstreamError() { c.upstreamErrs.Add(1) }
+
+// AddUpstreamNotFound counts one upstream 404: a legitimate not-found
+// (unknown repo/file), kept out of upstream_errors_total so routine
+// misses cannot bury real failures for alerting.
+func (c *Counters) AddUpstreamNotFound() { c.upstream404s.Add(1) }
 
 // AddBytesServed counts response body bytes written to clients.
 func (c *Counters) AddBytesServed(n int64) {
@@ -101,6 +107,7 @@ func (c *Counters) Render() string {
 	counter("hf_cache_hits_total", "Requests served from the cache.", c.hits.Load())
 	counter("hf_cache_misses_total", "Requests filled from upstream.", c.misses.Load())
 	counter("hf_cache_upstream_errors_total", "Upstream fetches that failed after retries.", c.upstreamErrs.Load())
+	counter("hf_cache_upstream_not_found_total", "Upstream fetches that legitimately returned 404 (kept out of upstream_errors_total).", c.upstream404s.Load())
 	counter("hf_cache_bytes_served_total", "Response body bytes written to clients.", uint64(c.bytesServed.Load()))
 	counter("hf_cache_bytes_pulled_total", "Body bytes ingested from upstream or staged via push.", uint64(c.bytesPulled.Load()))
 	return b.String()

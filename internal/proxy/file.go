@@ -523,7 +523,7 @@ func (p *Proxy) headUpstream(ctx context.Context, path string) (*http.Response, 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		resp.Body.Close()
-		return nil, &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream"}
+		return nil, &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream", code: "EntryNotFound"}
 	case resp.StatusCode >= 400:
 		resp.Body.Close()
 		return nil, &upstreamError{status: http.StatusBadGateway, upstream: resp.StatusCode, msg: "upstream error"}
@@ -553,19 +553,63 @@ func firstNonEmpty(vals ...string) string {
 // successful store Put. Any failure mid-flight aborts the upload and
 // publishes nothing: an object without a manifest entry is never served.
 //
+// Singleflight: concurrent cold GETs for the same object key collapse onto
+// ONE upstream transfer. The leader runs the tee loop; waiters block on
+// the transfer's done channel (bounded by their request context) and then
+// re-check the manifest — HIT when the leader published, else they race to
+// lead a fresh transfer. A disconnecting waiter stops only its own wait;
+// the leader's detached transfer runs to completion either way.
+//
 // The upstream fetch, upload and publish run under a context detached from
 // the client request, so a client disconnect stops only the client relay;
 // the server-side download runs to completion.
 // ponytail: unlimited detached cold pulls — add a semaphore and timeout if
 // this is ever exposed to untrusted networks.
 func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, file, key string) {
-	// Cold ranged GET: relay upstream's answer without caching.
-	// ponytail: partial responses never populate the cache; the file warms
-	// on its next full GET. Acceptable: HF clients rarely range-cold-pull.
+	// Cold ranged GET: relay upstream's answer, then warm the cache in the
+	// background (a 206 proves the file exists upstream) so range-only
+	// access patterns still converge to HITs.
 	if rg := r.Header.Get("Range"); rg != "" {
-		p.relayColdRange(w, r, repo, sha, file, rg)
+		status := p.relayColdRange(w, r, repo, sha, file, rg)
+		if status == http.StatusPartialContent {
+			go p.warmCold(ctxBackground(), repo, sha, file, key)
+		}
 		return
 	}
+
+	if !p.beginTransfer(key) {
+		// A transfer is already in flight for this object: wait for it,
+		// bounded by this request's context, then re-check the manifest.
+		if ch := p.waitTransfer(r.Context(), key); ch != nil {
+			select {
+			case <-ch:
+			case <-r.Context().Done():
+				return // client gave up; the leader keeps caching
+			}
+		}
+		if _, _, ok := p.fileEntry(r.Context(), repo, sha, file); ok {
+			p.serveGetMissServedWarm(w, r, repo, sha, file, key)
+			return
+		}
+		// The leader failed: take over rather than 502 behind its failure.
+		if !p.beginTransfer(key) {
+			// Lost the takeover race; wait once more.
+			if ch := p.waitTransfer(r.Context(), key); ch != nil {
+				select {
+				case <-ch:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			if _, _, ok := p.fileEntry(r.Context(), repo, sha, file); ok {
+				p.serveGetMissServedWarm(w, r, repo, sha, file, key)
+				return
+			}
+			p.writeErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	defer p.endTransfer(key)
 
 	ctx := context.Background() // detached: see comment above
 	p.m.AddMiss()
@@ -580,6 +624,69 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 		return
 	}
 
+	p.teeTransfer(w, resp, ctx, repo, sha, file, key)
+}
+
+// serveGetMissServedWarm answers a waiter whose leader finished caching:
+// identical to the HIT path, but consulted after the wait.
+func (p *Proxy) serveGetMissServedWarm(w http.ResponseWriter, r *http.Request, repo, sha, file, key string) {
+	if sum, size, ok := p.fileEntry(r.Context(), repo, sha, file); ok {
+		p.serveHit(w, r, repo, sha, file, key, sum, size,
+			func() { p.serveHeadMiss(w, r, repo, sha, file) },
+			func() { p.serveGetMiss(w, r, repo, sha, file, key) })
+	}
+}
+
+// ctxBackground exists for the single call site that wants a detached
+// context spelled locally (the range-warm goroutine).
+func ctxBackground() context.Context { return context.Background() }
+
+// warmCold fetches the FULL file from upstream and caches it exactly like
+// a cold GET, discarding the body (io.Discard as the client). Fired after
+// a cold ranged relay returned 206: the file exists, so warming it makes
+// range-only access patterns converge to HITs.
+func (p *Proxy) warmCold(ctx context.Context, repo, sha, file, key string) {
+	if !p.beginTransfer(key) {
+		return // a full GET is already warming it
+	}
+	defer p.endTransfer(key)
+
+	resp, err := p.fetchFile(ctx, http.MethodGet, resolvePath(repo, sha, file), "")
+	if err != nil {
+		return // logged upstream-side if interesting; next request retries
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	p.teeTransfer(io.Discard, resp, ctx, repo, sha, file, key)
+}
+
+// teeTransfer streams the upstream body to client (an io.Writer — the real
+// response or io.Discard for background warms) while teeing into a
+// streaming S3 upload and hashing, publishing the manifest entry only
+// after upstream EOF plus a successful store Put. Headers are written only
+// when client is an http.ResponseWriter.
+func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Context, repo, sha, file, key string) {
+	rw, isHTTP := w.(http.ResponseWriter)
+	if isHTTP {
+		h := rw.Header()
+		h.Set("X-Repo-Commit", sha)
+		h.Set("X-Cache", "MISS")
+		h.Set("Accept-Ranges", "bytes")
+		if v := resp.Header.Get("Content-Type"); v != "" {
+			h.Set("Content-Type", v)
+		}
+		if v := resp.Header.Get("Content-Length"); v != "" {
+			h.Set("Content-Length", v)
+		}
+		rw.WriteHeader(http.StatusOK)
+	}
+	var flusher http.Flusher
+	if isHTTP {
+		flusher, _ = rw.(http.Flusher)
+	}
+
 	// Tee: every chunk read upstream goes to the client, the hash, and the
 	// pipe feeding the store upload (multipart streaming, unknown size).
 	pr, pw := io.Pipe()
@@ -592,19 +699,6 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 		}
 		putDone <- err
 	}()
-
-	h := w.Header()
-	h.Set("X-Repo-Commit", sha)
-	h.Set("X-Cache", "MISS")
-	h.Set("Accept-Ranges", "bytes")
-	if v := resp.Header.Get("Content-Type"); v != "" {
-		h.Set("Content-Type", v)
-	}
-	if v := resp.Header.Get("Content-Length"); v != "" {
-		h.Set("Content-Length", v)
-	}
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
 
 	hash := sha256.New()
 	buf := make([]byte, chunkSize)
@@ -671,14 +765,15 @@ func (p *Proxy) relayStatus(w http.ResponseWriter, resp *http.Response, sha stri
 }
 
 // relayColdRange relays a cold ranged GET to upstream with the client's
-// Range header and caches nothing: partial responses never populate the
-// cache, so the file stays a MISS until a full GET happens.
-func (p *Proxy) relayColdRange(w http.ResponseWriter, r *http.Request, repo, sha, file, rg string) {
+// Range header and caches nothing directly (partial responses never
+// populate the cache); a 206 triggers a detached full warm in the caller.
+// Returns the relayed status for that trigger.
+func (p *Proxy) relayColdRange(w http.ResponseWriter, r *http.Request, repo, sha, file, rg string) int {
 	p.m.AddMiss()
 	resp, err := p.fetchFile(r.Context(), http.MethodGet, resolvePath(repo, sha, file), rg)
 	if err != nil {
 		p.fail(w, err)
-		return
+		return 0
 	}
 	defer resp.Body.Close()
 	h := w.Header()
@@ -691,6 +786,55 @@ func (p *Proxy) relayColdRange(w http.ResponseWriter, r *http.Request, repo, sha
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+	return resp.StatusCode
+}
+
+// ---- singleflight: one upstream transfer per object key ----
+//
+// inflight maps the S3 object key to a done channel closed when the
+// transfer finishes (success or failure). beginTransfer registers the
+// caller as leader (true) or reports a leader exists (false). Waiters
+// block on the channel, then re-check the manifest themselves: a HIT when
+// the leader published, a fresh takeover when it failed. The map is
+// bounded by concurrent transfers, not by request count.
+// ponytail: process-local; a second instance would need store-side
+// coordination to collapse cross-instance fetches.
+
+func (p *Proxy) beginTransfer(key string) bool {
+	p.sfMu.Lock()
+	defer p.sfMu.Unlock()
+	if p.inflight == nil {
+		p.inflight = map[string]chan struct{}{}
+	}
+	if _, busy := p.inflight[key]; busy {
+		return false
+	}
+	p.inflight[key] = make(chan struct{})
+	return true
+}
+
+// waitTransfer returns the done channel for an in-flight transfer, or nil
+// when none exists anymore.
+func (p *Proxy) waitTransfer(ctx context.Context, key string) <-chan struct{} {
+	p.sfMu.Lock()
+	defer p.sfMu.Unlock()
+	if ch, busy := p.inflight[key]; busy {
+		return ch
+	}
+	return nil
+}
+
+// endTransfer deregisters the caller's transfer and wakes every waiter.
+func (p *Proxy) endTransfer(key string) {
+	p.sfMu.Lock()
+	ch, busy := p.inflight[key]
+	if busy {
+		delete(p.inflight, key)
+	}
+	p.sfMu.Unlock()
+	if busy {
+		close(ch)
+	}
 }
 
 // fetchFile is the file lane's retrying fetch: one retry on connection
@@ -733,7 +877,7 @@ func (p *Proxy) fetchResp(ctx context.Context, method, path, rangeHdr string) (*
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		resp.Body.Close()
-		return nil, &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream"}
+		return nil, &upstreamError{status: http.StatusNotFound, upstream: resp.StatusCode, msg: "not found upstream", code: "EntryNotFound"}
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && rangeHdr != "":
 		// A cold ranged GET whose range upstream rejects must reach the
 		// client as upstream's own 416, not be re-mapped to a 502.

@@ -82,3 +82,36 @@ func TestIndexRoutes(t *testing.T) {
 		}
 	}
 }
+
+// TestWhoamiV2 pins the honest stub: token-validating tooling (huggingface-cli
+// login/whoami, HfApi.whoami) must get a well-formed answer, not a 404; we
+// serve anonymously and never pretend to validate tokens.
+func TestWhoamiV2(t *testing.T) {
+	h, _ := newMuxAny("http://upstream.invalid", "", newMemStore())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/whoami-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("whoami-v2 status = %d, want 200", resp.StatusCode)
+	}
+	var out struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+		Auth struct {
+			AccessToken struct {
+				Role string `json:"role"`
+			} `json:"accessToken"`
+		} `json:"auth"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode whoami-v2: %v", err)
+	}
+	if out.Type != "user" || out.Name != "anonymous" || out.Auth.AccessToken.Role != "read" {
+		t.Errorf("whoami-v2 = %+v, want anonymous read user", out)
+	}
+}

@@ -167,3 +167,35 @@ func TestMetricsColdRange416OneMiss(t *testing.T) {
 		t.Errorf("misses after cold ranged 416 = %s, want 1 (counted once)", miss)
 	}
 }
+
+// TestMetricsNotFoundSeparateFromUpstreamErrors: a legitimate upstream 404
+// must count in upstream_not_found_total, NOT in upstream_errors_total —
+// routine not-founds must not bury real failures for alerting.
+func TestMetricsNotFoundSeparateFromUpstreamErrors(t *testing.T) {
+	up, _ := newFakeUpstream(t)
+	st := newMemStore()
+	p, c := newCountedProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// File that does not exist upstream → 404.
+	resp, _ := proxyGet(t, srv.URL+"/org/name/resolve/main/absent.bin", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("absent file status = %d, want 404", resp.StatusCode)
+	}
+	if nf := countOf(t, c, "hf_cache_upstream_not_found_total"); nf != "1" {
+		t.Errorf("upstream_not_found after 404 = %s, want 1", nf)
+	}
+	if errs := countOf(t, c, "hf_cache_upstream_errors_total"); errs != "0" {
+		t.Errorf("upstream_errors after 404 = %s, want 0 (404 is not a failure)", errs)
+	}
+
+	// Metadata 404 same discipline.
+	proxyGet(t, srv.URL+"/api/models/org/absent-repo", nil)
+	if nf := countOf(t, c, "hf_cache_upstream_not_found_total"); nf != "2" {
+		t.Errorf("upstream_not_found after metadata 404 = %s, want 2", nf)
+	}
+	if errs := countOf(t, c, "hf_cache_upstream_errors_total"); errs != "0" {
+		t.Errorf("upstream_errors after metadata 404 = %s, want 0", errs)
+	}
+}

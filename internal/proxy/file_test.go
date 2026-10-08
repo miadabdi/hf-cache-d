@@ -971,3 +971,109 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string)
 	t.Fatalf("timed out waiting for %s", what)
 	return false
 }
+
+// TestXErrorCodeOn404s pins HF-compatible typed-error headers: stock
+// huggingface_hub raises RepositoryNotFoundError/EntryNotFoundError from
+// these; without them every 404 is an untyped error.
+func TestXErrorCodeOn404s(t *testing.T) {
+	up, _ := newFakeUpstream(t)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// File lane: absent file → EntryNotFound.
+	resp, _ := proxyGet(t, srv.URL+"/org/name/resolve/main/absent.bin", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("absent file status = %d, want 404", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Error-Code"); got != "EntryNotFound" {
+		t.Errorf("file 404 X-Error-Code = %q, want EntryNotFound", got)
+	}
+
+	// Metadata lane: unknown repo → RepoNotFound.
+	resp2, _ := proxyGet(t, srv.URL+"/api/models/org/absent-repo", nil)
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("absent repo status = %d, want 404", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("X-Error-Code"); got != "RepoNotFound" {
+		t.Errorf("metadata 404 X-Error-Code = %q, want RepoNotFound", got)
+	}
+}
+
+// TestConcurrentColdGetSingleflight: N simultaneous cold GETs of the same
+// file must produce exactly ONE upstream CDN fetch (the others wait and
+// share the result via the manifest), not N racing transfers.
+func TestConcurrentColdGetSingleflight(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := bytes.Repeat([]byte("sf-"), 300*1024) // ~900 KiB
+	addFile(t, f, "sf.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	const n = 8
+	var wg sync.WaitGroup
+	results := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, got := proxyGet(t, srv.URL+"/org/name/resolve/main/sf.bin", nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("cold GET %d status = %d, want 200", i, resp.StatusCode)
+				return
+			}
+			results[i] = got
+		}(i)
+	}
+	wg.Wait()
+	for i, got := range results {
+		if !bytes.Equal(got, body) {
+			t.Errorf("cold GET %d body mismatch (%d bytes)", i, len(got))
+		}
+	}
+
+	// Exactly one upstream file GET hit the CDN, no matter how the N
+	// requests interleaved.
+	waitFor(t, 5*time.Second, func() bool {
+		return f.cdnSeen["/org/name/resolve/"+sha1+"/sf.bin"] == 1
+	}, "exactly one upstream fetch")
+}
+
+// TestColdRangeGETTriggersWarm: a cold ranged GET that relays a 206 must
+// fire a detached background warm, so the file is cached after the relay
+// and the next full GET is a HIT.
+func TestColdRangeGETTriggersWarm(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := []byte("0123456789abcdefghij")
+	sum := addFile(t, f, "rw.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// Cold ranged GET: 206 relayed, and the warm fires in the background.
+	resp, got := proxyGet(t, srv.URL+"/org/name/resolve/main/rw.bin", map[string]string{"Range": "bytes=2-6"})
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("cold ranged GET status = %d, want 206", resp.StatusCode)
+	}
+	if !bytes.Equal(got, []byte("23456")) {
+		t.Errorf("ranged body = %q, want 23456", got)
+	}
+	key := fileKey(sha1, "org/name", "rw.bin")
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return st.has(key) && files["rw.bin"] == sum
+	}, "object + manifest entry after background warm")
+
+	// Next full GET is a HIT served from the store.
+	resp2, got2 := proxyGet(t, srv.URL+"/org/name/resolve/main/rw.bin", nil)
+	if resp2.Header.Get("X-Cache") != "HIT" {
+		t.Fatalf("post-warm GET X-Cache = %q, want HIT", resp2.Header.Get("X-Cache"))
+	}
+	if !bytes.Equal(got2, body) {
+		t.Errorf("post-warm body mismatch")
+	}
+}

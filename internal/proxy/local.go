@@ -91,7 +91,7 @@ func (p *Proxy) handleModelsLocal(w http.ResponseWriter, r *http.Request, repo, 
 		return false
 	}
 	if v.Commit == "" {
-		p.writeErr(w, http.StatusNotFound, "no such revision (local model)")
+		p.writeErrCode(w, http.StatusNotFound, "RevisionNotFound", "no such revision (local model)")
 		return true
 	}
 	m, err := p.localManifest(r, repo, v.Version)
@@ -170,7 +170,7 @@ func (p *Proxy) handleResolveFileLocal(w http.ResponseWriter, r *http.Request, r
 		return false
 	}
 	if v.Commit == "" {
-		p.writeErr(w, http.StatusNotFound, "no such revision (local model)")
+		p.writeErrCode(w, http.StatusNotFound, "RevisionNotFound", "no such revision (local model)")
 		return true
 	}
 	m, err := p.localManifest(r, repo, v.Version)
