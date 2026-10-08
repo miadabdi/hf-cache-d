@@ -1,0 +1,14 @@
+# Keep the build context to what the image build needs: cmd/, internal/,
+# go.mod, go.sum (plus Dockerfile itself). Everything else is dev tooling.
+.git
+.gitignore
+.dockerignore
+.superpowers
+.github
+test
+deploy
+scripts
+docker-compose.yml
+Dockerfile
+README.md
+hf-cache-d
