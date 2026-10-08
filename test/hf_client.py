@@ -7,7 +7,7 @@ what the mirror serves. This script is a driver only: all assertions live in
 the Go test.
 
 Usage:
-    hf_client.py <endpoint> <repo_id> <revision-or-dash> <local_dir> [expect-error]
+    hf_client.py <endpoint> <repo_id> <revision> <local_dir> [expect-error]
 
 Output (stdout, machine-parsable):
     DONE                              success
@@ -33,7 +33,7 @@ def main() -> int:
             repo_id=repo_id,
             endpoint=endpoint,
             local_dir=local_dir,
-            revision=None if revision == "-" else revision,
+            revision=revision,
             token=False,  # anonymous and deterministic: no ambient token
         )
     except Exception as exc:  # reported here, asserted Go-side
