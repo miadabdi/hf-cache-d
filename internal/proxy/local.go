@@ -120,7 +120,7 @@ func (p *Proxy) localTree(m *manifest.Manifest) []byte {
 	type entry struct {
 		Type string `json:"type"`
 		Path string `json:"path"`
-		Size int64  `json:"size,omitempty"`
+		Size int64  `json:"size"` // always present: 0-byte files are legal
 	}
 	seen := map[string]bool{}
 	out := []entry{}

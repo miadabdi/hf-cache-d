@@ -697,3 +697,62 @@ func hfGetRange(t *testing.T, rawURL, rng string) (*http.Response, []byte) {
 	}
 	return resp, body
 }
+
+// TestConcurrentStageAndSealSerialized: concurrent PUTs to one version race
+// a seal; the per-version mutex serializes them, so exactly one outcome
+// holds per request: PUTs before the seal land 201, PUTs after land 409, and
+// the seal either succeeds (200) or is beaten by another seal (409).
+func TestConcurrentStageAndSealSerialized(t *testing.T) {
+	l := newLane(t, "tok")
+	repo := "org/priv"
+	body := []byte("payload")
+	sum := shaHex(body)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	staged, conflicted, sealedOK, sealedConflict := 0, 0, 0, 0
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp := l.put(t, repo, "v1", fmt.Sprintf("f%d.bin", i), body, "tok")
+			mu.Lock()
+			switch resp.StatusCode {
+			case http.StatusCreated:
+				staged++
+			case http.StatusConflict:
+				conflicted++
+			default:
+				t.Errorf("PUT %d: unexpected status %d", i, resp.StatusCode)
+			}
+			mu.Unlock()
+		}(i)
+	}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			files := map[string]string{"f0.bin": sum}
+			resp, _ := l.seal(t, repo, "v1", files, nil, "tok")
+			mu.Lock()
+			switch resp.StatusCode {
+			case http.StatusOK:
+				sealedOK++
+			case http.StatusConflict:
+				sealedConflict++
+			default:
+				t.Errorf("seal: unexpected status %d", resp.StatusCode)
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if sealedOK+sealedConflict != 2 {
+		t.Errorf("seal outcomes = %d+%d, want 2 total", sealedOK, sealedConflict)
+	}
+	if sealedOK == 0 && staged > 0 {
+		t.Errorf("%d PUTs staged but no seal succeeded — staging and sealing are not serialized", staged)
+	}
+}

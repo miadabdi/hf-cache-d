@@ -125,16 +125,16 @@ func readIndex(ctx context.Context, st storeAPI, repo string) *Index {
 //
 // Any rev that matches nothing is ok=false; the caller turns that into a 404
 // for repos with at least one seal.
-func (ix *Index) Lookup(rev string) (Version, bool) {
-	if len(ix.Versions) == 0 {
+func (idx *Index) Lookup(rev string) (Version, bool) {
+	if len(idx.Versions) == 0 {
 		return Version{}, false
 	}
 	if rev == "" || rev == "main" {
 		// Versions are stored oldest-first; the last entry is latest-sealed.
-		last := ix.Versions[len(ix.Versions)-1]
+		last := idx.Versions[len(idx.Versions)-1]
 		return last, true
 	}
-	for _, v := range ix.Versions {
+	for _, v := range idx.Versions {
 		if v.Version == rev || v.Commit == rev {
 			return v, true
 		}
