@@ -1,0 +1,115 @@
+# CI: unit + integration + real-client tests against a compose SeaweedFS,
+# docker build + smoke, and (tag builds only) Docker Hub publish.
+#
+# Notes:
+# - Ports are free on CI runners: default 8333/9333, no override needed.
+# - The client suite needs huggingface_hub; runners have no system install,
+#   so this is the one network step: pip install of the pinned version.
+# - Python pinned to 3.12 via setup-python so the pip install is
+#   deterministic (huggingface_hub 0.36.2 supports 3.12; documented choice).
+# - Publish runs only on v* tags, never executes PR code, and never echoes
+#   secrets: DOCKERHUB_TOKEN is referenced only as a login password.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start SeaweedFS (compose) and prepare bucket
+        run: |
+          docker compose up -d
+          ./scripts/dev-s3.sh
+
+      - name: vet + unit + integration (race)
+        run: |
+          go vet ./...
+          go test -race ./...
+          go test -tags s3compose -race ./...
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned huggingface_hub
+        run: pip install huggingface_hub==0.36.2
+
+      - name: Real-client compatibility suite
+        run: go test -tags client ./test/ -run TestHFClient -v -timeout 600s
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs --tail 100
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then VERSION="$(git rev-parse --short HEAD)"; fi
+          docker build --build-arg VERSION="$VERSION" -t hf-cache-d:ci .
+
+      - name: Smoke against compose SeaweedFS
+        run: |
+          docker compose up -d
+          ./scripts/dev-s3.sh
+          GW="$(ip -4 addr show docker0 | grep -oP '(?<=inet )[\d.]+')"
+          docker run -d --name smoke -p 18080:8080 \
+            -e S3_ENDPOINT=http://$GW:8333 \
+            -e S3_BUCKET=test-bucket \
+            -e S3_ACCESS_KEY=test \
+            -e S3_SECRET_KEY=test12345678 \
+            -e PUSH_TOKEN=ci-token \
+            hf-cache-d:ci
+          for i in $(seq 1 30); do
+            body="$(curl -s --max-time 2 http://localhost:18080/healthz || true)"
+            echo "$body" | grep -q '"status":"ok"' && break
+            sleep 1
+          done
+          echo "healthz: $body"
+          echo "$body" | grep -q '"status":"ok"' || { docker logs smoke; exit 1; }
+          curl -sf http://localhost:18080/ >/dev/null   # route index answers
+          curl -sf http://localhost:18080/metricsz | head -3
+          docker rm -f smoke
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [test, docker-smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          docker build --build-arg VERSION="$TAG" -t miadabdi/hf-cache-d:"$TAG" -t miadabdi/hf-cache-d:latest .
+          docker push miadabdi/hf-cache-d:"$TAG"
+          docker push miadabdi/hf-cache-d:latest

@@ -1,0 +1,41 @@
+# Sample systemd unit for hf-cache-d.
+#
+# REFERENCE ONLY — this file is documentation, not an installation: nothing
+# in this repository installs, enables, or manages it. Adapt paths, users,
+# and the EnvironmentFile to your host before any use.
+#
+# Usage sketch (after adapting):
+#   cp deploy/hf-cache-d.service /etc/systemd/system/  # edit first!
+#   systemctl daemon-reload
+#   systemctl enable --now hf-cache-d
+#
+# The service is a single static binary; DynamicUser gives it a throwaway
+# uid per boot with no home directory. All configuration is env vars via
+# EnvironmentFile (see deploy/config.example.env).
+
+[Unit]
+Description=hf-cache-d — Hugging Face cache mirror and private artifact registry
+Documentation=https://github.com/miadabdi/hf-cache-d
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/hf-cache-d
+EnvironmentFile=/etc/hf-cache-d/env
+Restart=on-failure
+RestartSec=5
+
+# Hardening (reference values; review for your environment).
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# Logs go to stderr (journal); no log files are written.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
