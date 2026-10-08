@@ -2,6 +2,7 @@
 // serves the key layout shared by push and proxy:
 //
 //	priv/<org>/<name>/<version>/files/<file>     file bodies (immutable after seal)
+//	priv/<org>/<name>/<version>/stage.json       staged path set (marked sealed)
 //	priv/<org>/<name>/<version>/manifest.json    seal manifest; presence = sealed
 //	priv/<org>/<name>/index.json                 repo version index {versions, main}
 //

@@ -29,6 +29,7 @@ type pstore struct {
 	objs                map[string][]byte
 	failPutKeys         map[string]bool
 	failGet             bool            // every Get fails (transient S3 outage)
+	failGetKeys         map[string]bool // selected Get failures
 	failHeadKeys        map[string]bool // only these keys fail Head
 	hookIndexPut        func()          // runs before an index-key Put
 	indexPutAttempts    int
@@ -39,7 +40,7 @@ func newPStore() *pstore { return &pstore{objs: map[string][]byte{}} }
 
 func (m *pstore) Get(_ context.Context, key string) (io.ReadCloser, int64, error) {
 	m.mu.Lock()
-	failing := m.failGet
+	failing := m.failGet || m.failGetKeys[key]
 	m.mu.Unlock()
 	if failing {
 		return nil, 0, fmt.Errorf("pstore: simulated get failure")
@@ -364,9 +365,9 @@ func TestSealRejectsBadManifests(t *testing.T) {
 	if resp, _ := l.seal(t, "org/priv", "v1", map[string]string{"f.bin": strings.Repeat("0", 64)}, nil, "tok"); resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Errorf("sha mismatch: status %d, want 422", resp.StatusCode)
 	}
-	// Missing staged file.
-	if resp, _ := l.seal(t, "org/priv", "v1", map[string]string{"nope.bin": sums["f.bin"]}, nil, "tok"); resp.StatusCode != http.StatusNotFound {
-		t.Errorf("missing staged file: status %d, want 404", resp.StatusCode)
+	// Manifest's file set must match staged paths exactly.
+	if resp, _ := l.seal(t, "org/priv", "v1", map[string]string{"nope.bin": sums["f.bin"]}, nil, "tok"); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("different staged file: status %d, want 422", resp.StatusCode)
 	}
 	// Wrong listed size.
 	if resp, _ := l.seal(t, "org/priv", "v1", sums, map[string]int64{"f.bin": 999}, "tok"); resp.StatusCode != http.StatusUnprocessableEntity {
@@ -470,6 +471,138 @@ func TestSealIndexWriteFailureRecovery(t *testing.T) {
 		t.Errorf("post-recovery resolve = %d %q", r.StatusCode, got)
 	}
 	_ = commit
+}
+
+func TestSealIndexReadFailurePreservesVersions(t *testing.T) {
+	l := newLane(t, "tok")
+	repo := "org/priv"
+	first := stageAll(t, l, repo, "v1", map[string][]byte{"a": []byte("one")})
+	if resp, _ := l.seal(t, repo, "v1", first, nil, "tok"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial seal: %d", resp.StatusCode)
+	}
+	key := local.IndexKey(repo)
+	l.st.mu.Lock()
+	before := bytes.Clone(l.st.objs[key])
+	l.st.failGetKeys = map[string]bool{key: true}
+	l.st.mu.Unlock()
+	second := stageAll(t, l, repo, "v2", map[string][]byte{"b": []byte("two")})
+	if resp, _ := l.seal(t, repo, "v2", second, nil, "tok"); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("index Get failure: %d, want 500", resp.StatusCode)
+	}
+	l.st.mu.Lock()
+	got := bytes.Clone(l.st.objs[key])
+	l.st.failGetKeys = nil
+	l.st.mu.Unlock()
+	if !bytes.Equal(got, before) {
+		t.Fatal("durable index overwritten on transient read error")
+	}
+	if resp, _ := l.seal(t, repo, "v2", second, nil, "tok"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("recovery seal: %d", resp.StatusCode)
+	}
+	l.st.mu.Lock()
+	var idx local.Index
+	err := json.Unmarshal(l.st.objs[key], &idx)
+	l.st.mu.Unlock()
+	if err != nil || len(idx.Versions) != 2 {
+		t.Fatalf("recovered index: %+v, %v", idx, err)
+	}
+}
+
+func TestSealCorruptIndexDoesNotOverwrite(t *testing.T) {
+	l := newLane(t, "tok")
+	repo := "org/priv"
+	sums := stageAll(t, l, repo, "v1", map[string][]byte{"a": []byte("one")})
+	key := local.IndexKey(repo)
+	l.st.objs[key] = []byte("corrupt index")
+	if resp, _ := l.seal(t, repo, "v1", sums, nil, "tok"); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("corrupt index: %d, want 500", resp.StatusCode)
+	}
+	if string(l.st.objs[key]) != "corrupt index" {
+		t.Fatal("corrupt durable index overwritten")
+	}
+}
+
+func TestSealMissingIndexCreatesFreshIndex(t *testing.T) {
+	l := newLane(t, "tok")
+	sums := stageAll(t, l, "org/priv", "v1", map[string][]byte{"a": []byte("one")})
+	if resp, _ := l.seal(t, "org/priv", "v1", sums, nil, "tok"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("missing index should create index: %d", resp.StatusCode)
+	}
+	if ok, _, _ := l.st.Head(context.Background(), local.IndexKey("org/priv")); !ok {
+		t.Fatal("new index not persisted")
+	}
+}
+
+func TestSealManifestReadFailurePreservesImmutableManifest(t *testing.T) {
+	l := newLane(t, "tok")
+	repo, version := "org/priv", "v1"
+	sums := stageAll(t, l, repo, version, map[string][]byte{"a": []byte("one")})
+	mkey := local.ManifestKey(repo, version)
+	l.st.mu.Lock()
+	l.st.failPutKeys = map[string]bool{local.IndexKey(repo): true}
+	l.st.mu.Unlock()
+	if resp, _ := l.seal(t, repo, version, sums, nil, "tok"); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("index failure: %d", resp.StatusCode)
+	}
+	l.st.mu.Lock()
+	before := bytes.Clone(l.st.objs[mkey])
+	l.st.failPutKeys = nil
+	l.st.failGetKeys = map[string]bool{mkey: true}
+	l.st.mu.Unlock()
+	if resp, _ := l.seal(t, repo, version, sums, nil, "tok"); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("manifest Get failure: %d, want 500", resp.StatusCode)
+	}
+	l.st.mu.Lock()
+	got := bytes.Clone(l.st.objs[mkey])
+	l.st.failGetKeys = nil
+	l.st.mu.Unlock()
+	if !bytes.Equal(got, before) {
+		t.Fatal("immutable manifest overwritten on transient read error")
+	}
+	if resp, _ := l.seal(t, repo, version, sums, nil, "tok"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("manifest recovery: %d", resp.StatusCode)
+	}
+}
+
+func TestSealCorruptManifestDoesNotOverwrite(t *testing.T) {
+	l := newLane(t, "tok")
+	repo, version := "org/priv", "v1"
+	sums := stageAll(t, l, repo, version, map[string][]byte{"a": []byte("one")})
+	key := local.ManifestKey(repo, version)
+	l.st.objs[key] = []byte("corrupt manifest")
+	if resp, _ := l.seal(t, repo, version, sums, nil, "tok"); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("corrupt manifest: %d, want 500", resp.StatusCode)
+	}
+	if string(l.st.objs[key]) != "corrupt manifest" {
+		t.Fatal("corrupt immutable manifest overwritten")
+	}
+}
+
+func TestFailedStageInventoryCannotLeaveUntrackedFile(t *testing.T) {
+	l := newLane(t, "tok")
+	repo, version := "org/priv", "v1"
+	l.st.failPutKeys = map[string]bool{stageListKey(repo, version): true}
+	if resp := l.put(t, repo, version, "b", []byte("two"), "tok"); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("inventory write failure: %d", resp.StatusCode)
+	}
+	if exists, _, _ := l.st.Head(context.Background(), local.FileKey(repo, version, "b")); exists {
+		t.Fatal("body uploaded despite failed inventory registration")
+	}
+}
+
+func TestSealRequiresExactStagedSet(t *testing.T) {
+	l := newLane(t, "tok")
+	repo, version := "org/priv", "v1"
+	sums := stageAll(t, l, repo, version, map[string][]byte{"a": []byte("one"), "b": []byte("two")})
+	if resp, out := l.seal(t, repo, version, map[string]string{"a": sums["a"]}, nil, "tok"); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("omitted staged file: %d (%v), want 422", resp.StatusCode, out)
+	}
+	if ok, _, _ := l.st.Head(context.Background(), local.ManifestKey(repo, version)); ok {
+		t.Fatal("partial manifest sealed")
+	}
+	if resp, out := l.seal(t, repo, version, sums, nil, "tok"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("exact staged set: %d (%v)", resp.StatusCode, out)
+	}
 }
 
 // ---- local model serving through the HF routes ----
@@ -750,7 +883,8 @@ func hfGetRange(t *testing.T, rawURL, rng string) (*http.Response, []byte) {
 // TestConcurrentStageAndSealSerialized: concurrent PUTs to one version race
 // a seal; the per-version mutex serializes them, so exactly one outcome
 // holds per request: PUTs before the seal land 201, PUTs after land 409, and
-// the seal either succeeds (200) or is beaten by another seal (409).
+// the seal succeeds (200), rejects omitted concurrently staged files (422),
+// or is beaten by another seal (409).
 func TestConcurrentStageAndSealSerialized(t *testing.T) {
 	l := newLane(t, "tok")
 	repo := "org/priv"
@@ -766,7 +900,7 @@ func TestConcurrentStageAndSealSerialized(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	staged, conflicted, sealedOK, sealedConflict := 0, 0, 0, 0
+	staged, conflicted, sealedOK, sealedConflict, sealedIncomplete := 0, 0, 0, 0, 0
 
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -797,6 +931,8 @@ func TestConcurrentStageAndSealSerialized(t *testing.T) {
 				sealedOK++
 			case http.StatusConflict:
 				sealedConflict++
+			case http.StatusUnprocessableEntity:
+				sealedIncomplete++
 			default:
 				t.Errorf("seal: unexpected status %d", resp.StatusCode)
 			}
@@ -805,11 +941,11 @@ func TestConcurrentStageAndSealSerialized(t *testing.T) {
 	}
 	wg.Wait()
 
-	if sealedOK+sealedConflict != 2 {
-		t.Errorf("seal outcomes = %d+%d, want 2 total", sealedOK, sealedConflict)
+	if sealedOK+sealedConflict+sealedIncomplete != 2 {
+		t.Errorf("seal outcomes = %d+%d+%d, want 2 total", sealedOK, sealedConflict, sealedIncomplete)
 	}
-	if sealedOK == 0 && staged > 0 {
-		t.Errorf("%d PUTs staged but no seal succeeded — staging and sealing are not serialized", staged)
+	if sealedOK == 0 && staged > 0 && sealedIncomplete == 0 {
+		t.Errorf("%d PUTs staged but no seal succeeded or rejected incomplete manifest", staged)
 	}
 }
 
@@ -887,32 +1023,43 @@ func TestStoreFailureNeverFallsBackToPublic(t *testing.T) {
 
 // TestRefreshWinsOverInFlightRead (item 1b): a Get racing a Refresh must
 // observe the refreshed (newer) index, not install its stale read.
+type blockedIndexStore struct {
+	*pstore
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockedIndexStore) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	rc, n, err := s.pstore.Get(ctx, key) // capture old bytes before blocking
+	if key == local.IndexKey("org/r") {
+		close(s.entered)
+		<-s.release
+	}
+	return rc, n, err
+}
+
 func TestRefreshWinsOverInFlightRead(t *testing.T) {
-	st := newPStore()
+	base := newPStore()
+	old := &local.Index{Versions: []local.Version{{Version: "v1", Commit: strings.Repeat("a", 40)}}, Main: strings.Repeat("a", 40)}
+	body, _ := json.Marshal(old)
+	base.objs[local.IndexKey("org/r")] = body
+	st := &blockedIndexStore{pstore: base, entered: make(chan struct{}), release: make(chan struct{})}
 	ix := local.NewIndexes(st)
-
-	// Seed the store with an index, let a read start, then Refresh with a
-	// newer index before the read installs.
-	newIdx := &local.Index{
-		Versions: []local.Version{{Version: "v2", Commit: strings.Repeat("c", 40)}},
-		Main:     strings.Repeat("c", 40),
-	}
+	result := make(chan *local.Index, 1)
+	go func() {
+		got, _ := ix.Get(context.Background(), "org/r")
+		result <- got
+	}()
+	<-st.entered // read has captured old bytes but cannot install them yet
+	newIdx := &local.Index{Versions: []local.Version{{Version: "v2", Commit: strings.Repeat("c", 40)}}, Main: strings.Repeat("c", 40)}
 	ix.Refresh("org/r", newIdx)
-
-	// A concurrent read now either hits the refreshed entry directly or
-	// (in the raced path) must return the refreshed view, never nil.
-	got, err := ix.Get(context.Background(), "org/r")
-	if err != nil {
-		t.Fatal(err)
+	close(st.release)
+	if got := <-result; got == nil || got.Main != newIdx.Main {
+		t.Fatalf("in-flight read returned %+v, want refreshed index", got)
 	}
-	if got == nil || got.Main != strings.Repeat("c", 40) {
-		t.Errorf("Get after Refresh = %+v, want the refreshed index", got)
+	if got, err := ix.Get(context.Background(), "org/r"); err != nil || got.Main != newIdx.Main {
+		t.Fatalf("cached index regressed: %+v, %v", got, err)
 	}
-
-	// The raced-install path specifically: store returns an OLD index while
-	// a Refresh installs a new one mid-flight. Simulate by making the store
-	// read slow is overkill; the invariant "never older than installed" is
-	// what the code guarantees and the direct assertion above covers.
 }
 
 // TestCommitOfCanonicalJSON (item 2): the synthetic commit is sha256 of the

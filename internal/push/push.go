@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,7 @@ import (
 	"github.com/miadabdi/hf-cache-d/internal/local"
 	"github.com/miadabdi/hf-cache-d/internal/manifest"
 	"github.com/miadabdi/hf-cache-d/internal/metrics"
+	"github.com/miadabdi/hf-cache-d/internal/store"
 )
 
 // manifestMaxBytes caps the seal request body (small JSON: path→sha map).
@@ -163,6 +165,23 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 		return
 	}
 
+	// Record the path BEFORE uploading: an inventory write failure must
+	// never leave an untracked object that a seal could silently omit.
+	stageKey := stageListKey(repo, version)
+	staged, err := l.readStageList(r.Context(), stageKey)
+	if err != nil {
+		log.Printf("push stage list %s: %v", stageKey, err)
+		writeErr(w, http.StatusInternalServerError, "stage list read failed")
+		return
+	}
+	staged.Files[file] = true
+	stageBody, _ := json.Marshal(staged)
+	if err := l.store.Put(r.Context(), stageKey, strings.NewReader(string(stageBody)), int64(len(stageBody))); err != nil {
+		log.Printf("push stage list put %s: %v", stageKey, err)
+		writeErr(w, http.StatusInternalServerError, "stage list write failed")
+		return
+	}
+
 	key := local.FileKey(repo, version, file)
 	// Stream body → hash + S3 through a pipe: the SDK's single-shot Put
 	// needs a seekable body (payload checksum), but the request body is not
@@ -261,6 +280,26 @@ func (l *Lane) handleSeal(w http.ResponseWriter, r *http.Request, repo, version,
 		}
 	}
 
+	stageKey := stageListKey(repo, version)
+	staged, err := l.readStageList(r.Context(), stageKey)
+	if err != nil {
+		log.Printf("push stage list %s: %v", stageKey, err)
+		writeErr(w, http.StatusInternalServerError, "stage list read failed")
+		return
+	}
+	for file := range req.Files {
+		if !staged.Files[file] {
+			writeErr(w, http.StatusUnprocessableEntity, fmt.Sprintf("manifest file %q was not staged", file))
+			return
+		}
+	}
+	for file := range staged.Files {
+		if _, ok := req.Files[file]; !ok {
+			writeErr(w, http.StatusUnprocessableEntity, fmt.Sprintf("staged file %q omitted from manifest", file))
+			return
+		}
+	}
+
 	// Validate the staged bytes: head every object, hash it, compare. The
 	// stored hash is truth; a client-supplied hash that disagrees is 422.
 	sizes := map[string]int64{}
@@ -312,7 +351,13 @@ func (l *Lane) handleSeal(w http.ResponseWriter, r *http.Request, repo, version,
 	// this version was sealed before (possibly with a failed index write).
 	// Identical content (same derived commit) continues to the index update
 	// — that IS the recovery; different content is an immutable conflict.
-	if prev := l.readManifest(r.Context(), repo, version); prev != nil {
+	prev, err := l.readManifest(r.Context(), repo, version)
+	if err != nil {
+		log.Printf("push manifest read %s: %v", mkey, err)
+		writeErr(w, http.StatusInternalServerError, "manifest read failed")
+		return
+	}
+	if prev != nil {
 		if local.CommitOf(prev.Identity, prev.Files, prev.Sizes) != commit {
 			writeErr(w, http.StatusConflict, "version is sealed and immutable")
 			return
@@ -348,24 +393,68 @@ func (l *Lane) handleSeal(w http.ResponseWriter, r *http.Request, repo, version,
 		return
 	}
 
+	// Mark sealed, retaining inventory for recovery instead of requiring a
+	// store Delete operation. Sealed manifests remain the immutability gate.
+	staged.Sealed = true
+	stageBody, _ := json.Marshal(staged)
+	if err := l.store.Put(r.Context(), stageKey, strings.NewReader(string(stageBody)), int64(len(stageBody))); err != nil {
+		log.Printf("push stage list mark sealed %s: %v", stageKey, err)
+		// The seal and index are durable; do not report a false failure.
+	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"version": version,
 		"commit":  commit,
 	})
 }
 
-// readManifest loads the seal manifest, or nil when absent/corrupt.
-func (l *Lane) readManifest(ctx context.Context, repo, version string) *manifest.Manifest {
+// readManifest returns nil only for a confirmed absent seal manifest.
+func (l *Lane) readManifest(ctx context.Context, repo, version string) (*manifest.Manifest, error) {
 	rc, _, err := l.store.Get(ctx, local.ManifestKey(repo, version))
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rc.Close()
 	var m manifest.Manifest
-	if err := json.NewDecoder(rc).Decode(&m); err != nil || m.Files == nil {
-		return nil
+	if err := json.NewDecoder(rc).Decode(&m); err != nil {
+		return nil, err
 	}
-	return &m
+	if m.Files == nil {
+		return nil, fmt.Errorf("invalid seal manifest: missing files")
+	}
+	return &m, nil
+}
+
+// stage.json tracks the exact set of successfully staged paths. No bucket
+// listing or new store API is needed; the existing version lock serializes it.
+type stageList struct {
+	Files  map[string]bool `json:"files"`
+	Sealed bool            `json:"sealed,omitempty"`
+}
+
+func stageListKey(repo, version string) string {
+	return "priv/" + repo + "/" + version + "/stage.json"
+}
+
+func (l *Lane) readStageList(ctx context.Context, key string) (stageList, error) {
+	rc, _, err := l.store.Get(ctx, key)
+	if errors.Is(err, store.ErrNotFound) {
+		return stageList{Files: map[string]bool{}}, nil
+	}
+	if err != nil {
+		return stageList{}, err
+	}
+	defer rc.Close()
+	var staged stageList
+	if err := json.NewDecoder(rc).Decode(&staged); err != nil {
+		return stageList{}, err
+	}
+	if staged.Files == nil {
+		return stageList{}, fmt.Errorf("invalid stage list: missing files")
+	}
+	return staged, nil
 }
 
 // isSealed reports whether the version's manifest object exists.
@@ -386,7 +475,10 @@ func (l *Lane) commitIndex(ctx context.Context, repo, version, commit string) er
 	mu.Lock()
 	defer mu.Unlock()
 
-	idx := readStoreIndex(ctx, l.store, repo)
+	idx, err := readStoreIndex(ctx, l.store, repo)
+	if err != nil {
+		return fmt.Errorf("index read %s: %w", repo, err)
+	}
 	if idx == nil {
 		idx = &local.Index{}
 	}
@@ -424,17 +516,23 @@ func (l *Lane) commitIndex(ctx context.Context, repo, version, commit string) er
 
 // readStoreIndex re-reads the repo index from the store (bypasses the cache:
 // the cache may be stale relative to a recovery).
-func readStoreIndex(ctx context.Context, st Store, repo string) *local.Index {
+func readStoreIndex(ctx context.Context, st Store, repo string) (*local.Index, error) {
 	rc, _, err := st.Get(ctx, local.IndexKey(repo))
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rc.Close()
 	var idx local.Index
 	if err := json.NewDecoder(rc).Decode(&idx); err != nil {
-		return nil
+		return nil, err
 	}
-	return &idx
+	if idx.Versions == nil {
+		return nil, fmt.Errorf("invalid index: missing versions")
+	}
+	return &idx, nil
 }
 
 // handleList serves the anonymous version listing.
@@ -462,7 +560,13 @@ func (l *Lane) handleList(w http.ResponseWriter, r *http.Request, repo string) {
 	}{Repo: repo, Main: idx.Main, Versions: []listed{}}
 	for _, v := range idx.Versions {
 		files := 0
-		if m := l.readManifest(r.Context(), repo, v.Version); m != nil {
+		m, err := l.readManifest(r.Context(), repo, v.Version)
+		if err != nil {
+			log.Printf("push listing manifest %s: %v", local.ManifestKey(repo, v.Version), err)
+			writeErr(w, http.StatusInternalServerError, "manifest read failed")
+			return
+		}
+		if m != nil {
 			files = len(m.Files)
 		}
 		out.Versions = append(out.Versions, listed{
