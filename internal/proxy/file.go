@@ -324,7 +324,10 @@ func (p *Proxy) ManifestKeys() []string {
 // are the lane-specific miss continuations (upstream fetch for the public
 // lane, 404 for local models — a sealed local file has no upstream).
 func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file, key, sum string, size int64, onMiss, onGetMiss func()) {
-	p.m.AddHit()
+	// Hit/miss accounting: the hit is counted only once the stored object is
+	// CONFIRMED to exist (Head/Get succeeded). A vanished object self-heals
+	// onto the miss continuation, which counts its own miss — never a hit
+	// first. Errors (500) count neither.
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "HIT")
@@ -345,6 +348,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 		if hsize > 0 {
 			size = hsize
 		}
+		p.m.AddHit()
 		h.Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
 		return
@@ -382,6 +386,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 				return
 			}
 			defer rc.Close()
+			p.m.AddHit()
 			h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			h.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 			w.WriteHeader(http.StatusPartialContent)
@@ -402,6 +407,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, repo, sha, file
 		return
 	}
 	defer rc.Close()
+	p.m.AddHit()
 	h.Set("Content-Length", strconv.FormatInt(size, 10))
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, rc)
@@ -596,9 +602,9 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 }
 
 // relayStatus relays a non-200 upstream GET answer (e.g. a 304 or 404 that
-// slipped past the status mapping) verbatim.
+// slipped past the status mapping) verbatim. The miss was already counted by
+// the caller (serveGetMiss) — counting here too would double it.
 func (p *Proxy) relayStatus(w http.ResponseWriter, resp *http.Response, sha string) {
-	p.m.AddMiss()
 	h := w.Header()
 	h.Set("X-Repo-Commit", sha)
 	h.Set("X-Cache", "MISS")

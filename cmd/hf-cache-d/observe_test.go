@@ -225,6 +225,29 @@ func TestIntegrityCheckCleanPassNoOutput(t *testing.T) {
 	}
 }
 
+// TestIntegrityCheckJoinsOnCancel: the loop must exit promptly after ctx
+// cancellation (main's WaitGroup join must not hang shutdown), even while a
+// pass is between ticks.
+func TestIntegrityCheckJoinsOnCancel(t *testing.T) {
+	st := newMemStore()
+	var buf syncBuffer
+	logger := log.New(&buf, "", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runIntegrityChecks(ctx, st, fixedKeys{[]string{fmt.Sprintf("pub/%s/%s/manifest.json", goodSHA[:2], goodSHA)}}, logger, 20*time.Millisecond)
+		close(done)
+	}()
+	// Let at least one tick+pass run, then cancel.
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("integrity loop did not exit after cancellation (shutdown would hang)")
+	}
+}
+
 // TestLogMiddlewareRedactsNothingSensitiveAndCounts: the access log line
 // carries method/path/status/duration/cache/repo@commit and never an
 // Authorization value; bytes_served advances by the body length.

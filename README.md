@@ -46,9 +46,11 @@ curl -s localhost:8080/healthz           # {"status":"ok","version":"dev"}
 curl -s localhost:8080/                  # route index
 
 # 6-8: pull a public snapshot through the mirror (cached from here on)
+pip install huggingface_hub==0.36.2     # the tested client version
 HF_ENDPOINT=http://localhost:8080 python - <<'PY'
 from huggingface_hub import snapshot_download
-p = snapshot_download("org/name", token=False)   # any public model
+# any public model works; this one is tiny for a first pull
+snapshot_download("hf-internal-testing/tiny-random-bert", token=False)
 PY
 
 # 9-10: push + seal your own weights, then pull them like a model
@@ -139,8 +141,10 @@ repo of the same name, for every revision:
 pip install huggingface_hub==0.36.2
 HF_ENDPOINT=http://localhost:8080 python -c "
 from huggingface_hub import snapshot_download
-snapshot_download('org/name', token=False)      # public, via the mirror
-snapshot_download('my/model', token=False)       # your sealed weights
+# public model via the mirror (tiny example repo):
+snapshot_download('hf-internal-testing/tiny-random-bert', token=False)
+# your own sealed weights (repo you pushed + sealed, see below):
+snapshot_download('my/model', token=False)
 "
 ```
 

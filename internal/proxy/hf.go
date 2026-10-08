@@ -312,7 +312,8 @@ func (p *Proxy) servePinned(w http.ResponseWriter, r *http.Request, repo, sha, k
 		p.fail(w, err)
 		return
 	}
-	p.m.AddBytesPulled(int64(len(body)))
+	// bytes_pulled is counted inside fetchOnce (where the body is read);
+	// counting it here too would double every metadata miss.
 	env, _ := json.Marshal(cachedResp{Link: link, Body: string(body)})
 	if err := p.store.Put(r.Context(), key, bytes.NewReader(env), int64(len(env))); err != nil {
 		// Serving fresh data still works; only persistence failed.

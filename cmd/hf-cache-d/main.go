@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,10 +48,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Periodic manifest integrity self-check (disabled at interval 0). It
-	// shares the shutdown context: srv.Shutdown below outlives it via ctx.
+	// Periodic manifest integrity self-check (disabled at interval 0). The
+	// WaitGroup lets shutdown WAIT for an in-flight pass to finish before
+	// the process exits, instead of racing it.
+	var integrity sync.WaitGroup
 	if cfg.IntegrityCheckInterval > 0 {
-		go runIntegrityChecks(ctx, st, p, log.Default(), cfg.IntegrityCheckInterval)
+		integrity.Add(1)
+		go func() {
+			defer integrity.Done()
+			runIntegrityChecks(ctx, st, p, log.Default(), cfg.IntegrityCheckInterval)
+		}()
 	}
 
 	srv := &http.Server{
@@ -73,6 +80,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+	integrity.Wait() // join the self-check before exiting
 }
 
 // newMux builds the HTTP routing table.
