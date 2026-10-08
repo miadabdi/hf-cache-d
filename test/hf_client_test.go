@@ -17,6 +17,7 @@ package test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -41,14 +42,20 @@ func runClient(t *testing.T, endpoint, repo, revision, localDir string, expectEr
 	}
 	// No -I: isolated mode would drop the user site-packages the system
 	// huggingface_hub lives in. The script dir is this repo's test/ (trusted).
-	cmd := exec.Command("python3", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", args...)
 	cmd.Env = append(os.Environ(),
 		"HF_HOME="+hfHome,
+		"HF_HUB_CACHE="+filepath.Join(hfHome, "hub"), // pin: ambient value must not override the fresh home
 		"HF_HUB_DISABLE_TELEMETRY=1",
 		"HF_HUB_DISABLE_PROGRESS_BARS=1",
 		"HF_HUB_OFFLINE=0",
 	)
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("python driver for %s@%s timed out after 30s (wedged service?)", repo, revision)
+	}
 	if err != nil {
 		t.Fatalf("python driver for %s@%s failed: %v\n%s", repo, revision, err, out)
 	}
@@ -80,7 +87,7 @@ func assertDirBytes(t *testing.T, dir string, want map[string][]byte) {
 			t.Fatalf("downloaded %s: %v", name, err)
 		}
 		if !bytes.Equal(got, body) {
-			t.Fatalf("downloaded %s: %d bytes, want %d byte-identical", name, len(got), len(body))
+			t.Fatalf("downloaded %s: got %d bytes, want %d", name, len(got), len(body))
 		}
 	}
 	seen := map[string]bool{}
@@ -117,11 +124,16 @@ func TestHFClientPublicSnapshot(t *testing.T) {
 	f := newFakeHub(t, repo, files)
 	srv := pushLane(t, st, f.upstream, "")
 
-	// Cold pull.
+	// Cold pull: exactly two upstream CDN hits per file (the stock client
+	// HEADs then GETs, and the proxy follows both to the CDN server-side) —
+	// the anchor that makes the warm zero-delta below self-evidencing.
 	cold := t.TempDir()
 	runClient(t, srv.URL, repo, "main", cold, false)
 	assertDirBytes(t, cold, files)
 	cdnAfterCold := f.cdnCount()
+	if want := 2 * len(files); cdnAfterCold != want {
+		t.Errorf("upstream CDN file requests after cold pull = %d, want %d (HEAD+GET per file)", cdnAfterCold, want)
+	}
 
 	// Warm pull: barrier FIRST (the cold pull's detached publish must be
 	// durable or the warm pull would legitimately re-fetch), then a FRESH
