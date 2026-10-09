@@ -58,14 +58,14 @@ type fakeUpstream struct {
 	gotCookie string
 
 	// File-lane state (Task 3).
-	files    map[string][]byte // repo-relative path -> body served for repo@main
-	lfs      map[string]bool   // repo-relative path -> served via 302 with X-Linked-* (default true when nil)
-	truncate int               // >0: serve only the first N bytes then hang up
-	truncateOnce int           // >0: cut the FIRST full GET at N bytes once (resume tests), then serve fully
-	slow     int               // >0: CDN ms sleep per 8KiB chunk (disconnect tests)
-	xetMode  bool              // CDN hop carries only its CAS ETag (no X-Linked-ETag), like xet-backed LFS
-	cdnSeen  map[string]int    // fake-CDN request counts by path (not query)
-	cdn      *httptest.Server
+	files        map[string][]byte // repo-relative path -> body served for repo@main
+	lfs          map[string]bool   // repo-relative path -> served via 302 with X-Linked-* (default true when nil)
+	truncate     int               // >0: serve only the first N bytes then hang up
+	truncateOnce int               // >0: cut the FIRST full GET at N bytes once (resume tests), then serve fully
+	slow         int               // >0: CDN ms sleep per 8KiB chunk (disconnect tests)
+	xetMode      bool              // CDN hop carries only its CAS ETag (no X-Linked-ETag), like xet-backed LFS
+	cdnSeen      map[string]int    // fake-CDN request counts by path (not query)
+	cdn          *httptest.Server
 }
 
 func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
