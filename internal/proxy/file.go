@@ -554,6 +554,7 @@ func (p *Proxy) headUpstream(ctx context.Context, path string) (*http.Response, 
 		if err != nil {
 			return nil, err
 		}
+		p.authUpstream(req)
 		r, err := p.headClient.Do(req)
 		if err != nil {
 			if attempt == 1 {
@@ -1156,8 +1157,10 @@ func (p *Proxy) fetchResp(ctx context.Context, method, path, rangeHdr string) (*
 		req.Header.Set("Range", rangeHdr)
 	}
 	// Anonymous: inbound Authorization/Cookie never reach upstream. The
-	// file client has no overall deadline so detached transfers run to
+	// MIRROR's own token (if configured) does — the gated-repo fetch path.
+	// The file client has no overall deadline so detached transfers run to
 	// completion (see the Proxy.fileClient comment).
+	p.authUpstream(req)
 	resp, err := p.fileClient.Do(req)
 	if err != nil {
 		return nil, &upstreamError{status: http.StatusBadGateway, msg: "upstream unreachable"}

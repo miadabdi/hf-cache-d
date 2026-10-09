@@ -943,6 +943,38 @@ func TestNoCredentialsForwarded(t *testing.T) {
 	}
 }
 
+// TestUpstreamTokenRidesUpstreamNotClient: with HF_UPSTREAM_TOKEN set, the
+// MIRROR's token authenticates upstream fetches on every lane (metadata,
+// file GET, HEAD) while inbound client credentials are still stripped —
+// the mirror's token must never be echoable by a reader, and a reader's
+// token must never reach upstream.
+func TestUpstreamTokenRidesUpstreamNotClient(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	st := newMemStore()
+	f.files["f.bin"] = []byte("upstream-token-file")
+	p, _ := newTestProxy(t, up.URL, st)
+	p.SetUpstreamToken("mirror-secret-token")
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// Metadata lane, inbound client creds present: upstream must see the
+	// MIRROR token, never the client's.
+	proxyGet(t, srv.URL+"/api/models/org/name", map[string]string{
+		"Authorization": "Bearer client-sekrit",
+	})
+	if auth, _ := f.lastAuth(); auth != "Bearer mirror-secret-token" {
+		t.Errorf("metadata lane upstream Authorization = %q, want the mirror token", auth)
+	}
+
+	// File lane GET + HEAD through the mirror (newTestServer mounts both).
+	proxyGet(t, srv.URL+"/org/name/resolve/main/f.bin", map[string]string{
+		"Authorization": "Bearer client-sekrit",
+	})
+	if auth, _ := f.lastAuth(); auth != "Bearer mirror-secret-token" {
+		t.Errorf("file lane upstream Authorization = %q, want the mirror token", auth)
+	}
+}
+
 // TestXetReadTokenStub: hub 1.x on xet-backed repos calls
 // /api/models/{repo}/xet-read-token/{hash} BEFORE falling back to classic
 // resolve; a 400 BadRequestError (unknown path under repo) is opaque. A

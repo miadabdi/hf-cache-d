@@ -44,6 +44,7 @@ func main() {
 	}
 
 	handler, p := newMux(cfg.HFUpstream, cfg.PushToken, st, cfg.MaxColdTransfers)
+	p.SetUpstreamToken(cfg.UpstreamToken)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

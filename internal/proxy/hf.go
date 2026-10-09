@@ -62,6 +62,10 @@ type Proxy struct {
 	// CDN's CAS ETag. See New for the why.
 	headClient *http.Client
 	now        func() time.Time
+	// upstreamToken, when set (HF_UPSTREAM_TOKEN), rides every outbound
+	// upstream request so gated repos can be fetched and cached. Inbound
+	// client Authorization is always stripped (see authUpstream callers).
+	upstreamToken string
 
 	mu   sync.Mutex
 	refs map[string]refEntry // "repo/rev" -> commit + expiry
@@ -146,6 +150,19 @@ func (p *Proxy) SetMaxColdTransfers(n int) {
 
 // SetCounters installs a private counter set (tests).
 func (p *Proxy) SetCounters(c *metrics.Counters) { p.m = c }
+
+// SetUpstreamToken authenticates UPSTREAM requests (HF_UPSTREAM_TOKEN) so
+// the mirror can fetch gated repos. Inbound client credentials are always
+// stripped — this token never reaches a reader, and readers stay anonymous.
+func (p *Proxy) SetUpstreamToken(tok string) { p.upstreamToken = tok }
+
+// authUpstream sets the configured upstream bearer token, if any. Called on
+// every outbound request the mirror itself constructs.
+func (p *Proxy) authUpstream(req *http.Request) {
+	if p.upstreamToken != "" {
+		req.Header.Set("Authorization", "Bearer "+p.upstreamToken)
+	}
+}
 
 // Register mounts the metadata routes on mux. The /api/models/ subtree is
 // claimed wholesale; the file lane (RegisterFiles) cannot share this mux —
@@ -542,7 +559,9 @@ func (p *Proxy) fetchOnce(ctx context.Context, path string, q url.Values, code s
 		return nil, "", err
 	}
 	// The public lane is anonymous: the inbound request's Authorization and
-	// Cookie headers never reach upstream.
+	// Cookie headers never reach upstream. The MIRROR's own token (if
+	// configured) does — that is the gated-repo fetch path.
+	p.authUpstream(req)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, "", &upstreamError{status: http.StatusBadGateway, msg: "upstream unreachable"}

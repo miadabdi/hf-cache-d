@@ -18,6 +18,12 @@ type Config struct {
 	HFUpstream  string // HF_UPSTREAM, default "https://huggingface.co"
 	PushToken   string // PUSH_TOKEN, empty means push lane disabled
 
+	// UpstreamToken authenticates UPSTREAM fetches (HF_UPSTREAM_TOKEN) so the
+	// mirror can cache gated repos. Empty = fully anonymous (v0.1 behavior).
+	// Inbound client tokens are always stripped — the token never leaks to
+	// readers, readers never need one.
+	UpstreamToken string // HF_UPSTREAM_TOKEN, empty means anonymous upstream
+
 	// IntegrityCheckInterval is how often the background self-check verifies
 	// one random manifest's files (sha256 of stored bytes vs the manifest).
 	// Zero disables the self-check entirely.
@@ -41,6 +47,7 @@ func LoadConfig() (Config, error) {
 		S3SecretKey: strings.TrimSpace(os.Getenv("S3_SECRET_KEY")),
 		HFUpstream:  strings.TrimSpace(os.Getenv("HF_UPSTREAM")),
 		PushToken:   os.Getenv("PUSH_TOKEN"),
+		UpstreamToken: strings.TrimSpace(os.Getenv("HF_UPSTREAM_TOKEN")),
 	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8080"
