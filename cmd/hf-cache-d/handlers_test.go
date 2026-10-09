@@ -115,3 +115,49 @@ func TestWhoamiV2(t *testing.T) {
 		t.Errorf("whoami-v2 = %+v, want anonymous read user", out)
 	}
 }
+
+// TestHealthzDeep: ?deep=1 must probe the object store (HeadObject) so
+// monitoring distinguishes "process up" from "can serve" — the fleet saw
+// status:ok while SeaweedFS's filer was wedged and every write 500ing.
+func TestHealthzDeep(t *testing.T) {
+	st := newMemStore()
+	h, _ := newMuxAny("http://upstream.invalid", "", st, 0)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Healthy store: deep check passes and reports s3:ok.
+	resp, err := http.Get(srv.URL + "/healthz?deep=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Status string `json:"status"`
+		S3     string `json:"s3"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || out.Status != "ok" || out.S3 != "ok" {
+		t.Errorf("deep healthz healthy = %d %+v, want 200 {ok ok}", resp.StatusCode, out)
+	}
+
+	// Broken store: deep check FAILS (503) — plain healthz stays ok.
+	st.mu.Lock()
+	st.failGet = true
+	st.mu.Unlock()
+	resp2, _ := http.Get(srv.URL + "/healthz?deep=1")
+	var out2 struct {
+		Status string `json:"status"`
+		S3     string `json:"s3"`
+	}
+	json.NewDecoder(resp2.Body).Decode(&out2)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusServiceUnavailable || out2.S3 != "err" {
+		t.Errorf("deep healthz broken = %d %+v, want 503 {s3:err}", resp2.StatusCode, out2)
+	}
+	resp3, _ := http.Get(srv.URL + "/healthz")
+	b3, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+	if !strings.Contains(string(b3), `"ok"`) {
+		t.Errorf("plain healthz on broken store = %s, want process-level ok", b3)
+	}
+}

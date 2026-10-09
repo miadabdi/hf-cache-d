@@ -119,7 +119,9 @@ func newMuxAny(upstream, pushToken string, st muxStore, maxCold int) (http.Handl
 
 	pl := push.New(pushToken, st, ix)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		handleHealthz(w, r, st)
+	})
 	mux.HandleFunc("/metricsz", handleMetricsz)
 	p.Register(mux)  // /api/models/
 	pl.Register(mux) // /v1/artifacts/
@@ -142,10 +144,29 @@ type muxStore interface {
 	GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error)
 }
 
-func handleHealthz(w http.ResponseWriter, r *http.Request) {
+// healthStore is the slice of the store the deep healthz probe needs.
+type healthStore interface {
+	Head(ctx context.Context, key string) (bool, int64, error)
+}
+
+// handleHealthz answers the process check; ?deep=1 additionally probes the
+// object store (HeadObject on a probe key — 404 is healthy, only transport
+// errors fail) so monitoring distinguishes "process up" from "can serve".
+func handleHealthz(w http.ResponseWriter, r *http.Request, st healthStore) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Query().Get("deep") == "1" {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if _, _, err := st.Head(ctx, "healthz-probe"); err != nil {
+			log.Printf("deep healthz: store probe: %v", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "degraded", "s3": "err", "version": version})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "s3": "ok", "version": version})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version})

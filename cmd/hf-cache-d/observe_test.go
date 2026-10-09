@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -27,8 +28,9 @@ var errNotFound = store.ErrNotFound
 // memStore is the cmd-level in-memory store fake (the proxy package's cannot
 // be imported). Sufficient for the metrics/integrity/middleware tests here.
 type memStore struct {
-	mu   sync.Mutex
-	objs map[string][]byte
+	mu      sync.Mutex
+	objs    map[string][]byte
+	failGet bool // every Get/Head returns a transport error (wedge fixture)
 }
 
 func newMemStore() *memStore { return &memStore{objs: map[string][]byte{}} }
@@ -36,6 +38,9 @@ func newMemStore() *memStore { return &memStore{objs: map[string][]byte{}} }
 func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failGet {
+		return nil, 0, errors.New("memstore: simulated wedge")
+	}
 	b, ok := m.objs[key]
 	if !ok {
 		return nil, 0, errNotFound
@@ -45,6 +50,9 @@ func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, int64, err
 func (m *memStore) GetRange(_ context.Context, key string, start, end int64) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failGet {
+		return nil, errors.New("memstore: simulated wedge")
+	}
 	b, ok := m.objs[key]
 	if !ok {
 		return nil, errNotFound
@@ -64,6 +72,9 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64) erro
 func (m *memStore) Head(_ context.Context, key string) (bool, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failGet {
+		return false, 0, errors.New("memstore: simulated wedge")
+	}
 	b, ok := m.objs[key]
 	return ok, int64(len(b)), nil
 }
