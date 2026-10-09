@@ -187,6 +187,7 @@ curl -s "$ENDPOINT/v1/artifacts/org/name"
   `hf_cache_requests_total{route}`, `hf_cache_hits_total`,
   `hf_cache_misses_total`, `hf_cache_upstream_errors_total`,
   `hf_cache_bytes_served_total`, `hf_cache_bytes_pulled_total`.
+- **Deep healthz**: `/healthz?deep=1` additionally HeadObjects the store (503 `{s3:err}` when the object backend is unreachable; plain `/healthz` is the cheap process check). Monitoring should use the deep variant for "can serve".
 - **Integrity self-check**: every `INTEGRITY_CHECK_INTERVAL`, one random
   cached manifest's files are re-hashed and compared against the recorded
   sha256. A mismatch logs `CRITICAL: integrity mismatch:` (the object is

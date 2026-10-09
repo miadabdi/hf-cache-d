@@ -1,12 +1,12 @@
 package main
 
 import (
-	"errors"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -159,7 +159,7 @@ func TestMetricszCountsAcrossRequests(t *testing.T) {
 		`hf_cache_requests_total{route="metricsz"} 1`,
 		"hf_cache_hits_total 1",
 		"hf_cache_misses_total 1",
-		"hf_cache_bytes_pulled_total ", // >0; exact value depends on JSON length
+		"hf_cache_bytes_pulled_upstream_total ", // >0; exact value depends on JSON length
 		"hf_cache_upstream_errors_total 0",
 	} {
 		if !strings.Contains(body, want) {

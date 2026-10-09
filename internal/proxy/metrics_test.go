@@ -60,7 +60,7 @@ func TestMetricsMetadataBytesPulledOnce(t *testing.T) {
 	if n := 2 * resolveLen; n > 0 {
 		want = fmt.Sprint(n)
 	}
-	if got := countOf(t, c, "hf_cache_bytes_pulled_total"); got != want {
+	if got := countOf(t, c, "hf_cache_bytes_pulled_upstream_total"); got != want {
 		t.Errorf("bytes_pulled after cold metadata = %s, want %s (resolve+info, each once)", got, want)
 	}
 	if miss := countOf(t, c, "hf_cache_misses_total"); miss != "1" {
@@ -69,7 +69,7 @@ func TestMetricsMetadataBytesPulledOnce(t *testing.T) {
 
 	// Warm: hit, nothing new pulled.
 	proxyGet(t, srv.URL+"/api/models/org/name", nil)
-	if got2 := countOf(t, c, "hf_cache_bytes_pulled_total"); got2 != want {
+	if got2 := countOf(t, c, "hf_cache_bytes_pulled_upstream_total"); got2 != want {
 		t.Errorf("bytes_pulled after warm = %s, want unchanged %s", got2, want)
 	}
 	if hit := countOf(t, c, "hf_cache_hits_total"); hit != "1" {
@@ -100,7 +100,7 @@ func TestMetricsFileColdThenWarm(t *testing.T) {
 		t.Errorf("misses after cold GET = %s, want 1", miss)
 	}
 	// resolve JSON (90 bytes, fetched once) + file body (16 bytes, once).
-	if pulled := countOf(t, c, "hf_cache_bytes_pulled_total"); pulled != "106" {
+	if pulled := countOf(t, c, "hf_cache_bytes_pulled_upstream_total"); pulled != "106" {
 		t.Errorf("bytes_pulled after cold GET = %s, want 106 (resolve+body, each once)", pulled)
 	}
 
@@ -111,7 +111,7 @@ func TestMetricsFileColdThenWarm(t *testing.T) {
 	if hit := countOf(t, c, "hf_cache_hits_total"); hit != "1" {
 		t.Errorf("hits after warm GET = %s, want 1", hit)
 	}
-	if pulled := countOf(t, c, "hf_cache_bytes_pulled_total"); pulled != "106" {
+	if pulled := countOf(t, c, "hf_cache_bytes_pulled_upstream_total"); pulled != "106" {
 		t.Errorf("bytes_pulled after warm = %s, want 106 (unchanged)", pulled)
 	}
 }

@@ -26,6 +26,8 @@ type countersWriter struct {
 	http.ResponseWriter
 	status int
 	bytes  int64
+
+	firstByte time.Time // zero until the first byte is written
 }
 
 func (cw *countersWriter) WriteHeader(code int) {
@@ -34,6 +36,9 @@ func (cw *countersWriter) WriteHeader(code int) {
 }
 
 func (cw *countersWriter) Write(p []byte) (int, error) {
+	if cw.firstByte.IsZero() {
+		cw.firstByte = time.Now()
+	}
 	n, err := cw.ResponseWriter.Write(p)
 	cw.bytes += int64(n)
 	return n, err
@@ -84,6 +89,9 @@ func logMiddleware(c *metrics.Counters, logger *log.Logger) func(http.Handler) h
 			start := time.Now()
 			cw := &countersWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(cw, r)
+			if !cw.firstByte.IsZero() {
+				c.AddFirstByte(routeOf(r.URL.Path), cw.firstByte.Sub(start))
+			}
 
 			cache, commit := cw.Header().Get("X-Cache"), cw.Header().Get("X-Repo-Commit")
 			at := ""

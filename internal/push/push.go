@@ -218,7 +218,7 @@ func (l *Lane) handleStage(w http.ResponseWriter, r *http.Request, repo, version
 		return
 	}
 	sum := hex.EncodeToString(hash.Sum(nil))
-	l.m.AddBytesPulled(r.ContentLength)
+	l.m.AddBytesStagedPush(r.ContentLength)
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"file":   file,
 		"sha256": sum,
