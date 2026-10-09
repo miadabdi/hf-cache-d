@@ -934,3 +934,21 @@ func TestNoCredentialsForwarded(t *testing.T) {
 		t.Errorf("upstream saw Authorization=%q Cookie=%q, both must be empty", auth, cookie)
 	}
 }
+
+// TestXetReadTokenStub: hub 1.x on xet-backed repos calls
+// /api/models/{repo}/xet-read-token/{hash} BEFORE falling back to classic
+// resolve; a 400 BadRequestError (unknown path under repo) is opaque. A
+// plain 404 is what a non-xet repo answers, so the client falls back
+// cleanly without every consumer setting HF_HUB_DISABLE_XET=1.
+func TestXetReadTokenStub(t *testing.T) {
+	up, _ := newFakeUpstream(t)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	resp, _ := proxyGet(t, srv.URL+"/api/models/org/name/xet-read-token/abc123", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("xet-read-token status = %d, want 404 (clean classic fallback)", resp.StatusCode)
+	}
+}

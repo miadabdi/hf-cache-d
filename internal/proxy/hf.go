@@ -164,6 +164,13 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		kind, rev = "info", strings.TrimPrefix(tail, "revision/")
 	case strings.HasPrefix(tail, "tree/"):
 		kind, rev = "tree", strings.TrimPrefix(tail, "tree/")
+	case strings.HasPrefix(tail, "xet-read-token/"):
+		// hub 1.x probes this on xet-backed repos before classic resolve.
+		// The mirror serves classic resolve only; a plain 404 is exactly
+		// what a non-xet repo answers, so the client falls back cleanly
+		// (no HF_HUB_DISABLE_XET needed, no opaque BadRequestError).
+		p.writeErr(w, http.StatusNotFound, "xet not supported; use classic resolve")
+		return
 	default:
 		p.writeErr(w, http.StatusBadRequest, "unknown path under repo")
 		return

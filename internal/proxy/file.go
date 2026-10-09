@@ -973,7 +973,7 @@ type transfer struct {
 	subs     map[chan []byte]bool // live subscriber chunk channels
 	hdr      http.Header          // captured response headers (set once)
 	hdrOK    bool
-	streamed bool // tee loop began broadcasting: late joiners get the fallback
+	streamed bool  // tee loop began broadcasting: late joiners get the fallback
 	err      error // terminal outcome for post-hoc waiters
 }
 
