@@ -952,3 +952,25 @@ func TestXetReadTokenStub(t *testing.T) {
 		t.Fatalf("xet-read-token status = %d, want 404 (clean classic fallback)", resp.StatusCode)
 	}
 }
+
+// TestMetadataClientHasOwnTransport: the metadata lane must not share a
+// transport with the file lane — saturating file pulls starve small API
+// calls otherwise (fleet issue #3: revision GETs 502'd for 2m during big
+// transfers).
+func TestMetadataClientHasOwnTransport(t *testing.T) {
+	up, _ := newFakeUpstream(t)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	if p.client == p.fileClient {
+		t.Fatal("metadata client shares the file client — no lane isolation")
+	}
+	if p.client.Transport == http.DefaultTransport || p.client.Transport == nil && p.fileClient.Transport == nil {
+		t.Log("note: both nil transports would share http.DefaultTransport")
+	}
+	if p.client.Transport == nil || p.fileClient.Transport == nil {
+		t.Fatal("lanes must each own an explicit transport (nil falls back to the SHARED DefaultTransport)")
+	}
+	if p.client.Transport == p.fileClient.Transport {
+		t.Fatal("lanes share one transport — connection pool contention")
+	}
+}

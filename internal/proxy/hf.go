@@ -94,11 +94,25 @@ type refEntry struct {
 
 // New builds a Proxy against the given HF upstream base URL and store.
 func New(upstream string, st storeAPI) *Proxy {
+	// Per-lane transports: saturating file transfers must not starve small
+	// metadata API calls of connections (fleet issue #3 — revision GETs
+	// 502'd for minutes during multi-GB pulls). Nil Transport would fall
+	// back to the SHARED http.DefaultTransport, defeating the isolation.
+	metaTransport := &http.Transport{
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	fileTransport := &http.Transport{
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &Proxy{
 		upstream:   strings.TrimRight(upstream, "/"),
 		store:      st,
-		client:     &http.Client{Timeout: 60 * time.Second},
-		fileClient: &http.Client{},
+		client:     &http.Client{Timeout: 60 * time.Second, Transport: metaTransport},
+		fileClient: &http.Client{Transport: fileTransport},
 		// headClient stops at HF's 302 resolve hop: the pre-redirect response
 		// carries X-Linked-ETag/X-Linked-Size (the sha256 truth), while the
 		// CDN hop's own ETag is a CAS-style hash for xet-backed files that
