@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,12 @@ type Config struct {
 	// one random manifest's files (sha256 of stored bytes vs the manifest).
 	// Zero disables the self-check entirely.
 	IntegrityCheckInterval time.Duration // INTEGRITY_CHECK_INTERVAL, default 1h
+
+	// MaxColdTransfers caps concurrent cold upstream transfers (leaders +
+	// background warms). Overflow requests stream through uncached instead
+	// of queueing — every client still gets bytes; the cap protects the
+	// shared egress (VPN) and the object store from transfer storms.
+	MaxColdTransfers int // MAX_COLD_TRANSFERS, default 3
 }
 
 // LoadConfig reads the environment and validates required variables,
@@ -48,6 +55,15 @@ func LoadConfig() (Config, error) {
 			return Config{}, fmt.Errorf("INTEGRITY_CHECK_INTERVAL must be a non-negative duration (e.g. 1h, 30m), got %q", v)
 		}
 		cfg.IntegrityCheckInterval = d // 0 disables
+	}
+
+	cfg.MaxColdTransfers = 3
+	if v := strings.TrimSpace(os.Getenv("MAX_COLD_TRANSFERS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("MAX_COLD_TRANSFERS must be a positive integer, got %q", v)
+		}
+		cfg.MaxColdTransfers = n
 	}
 
 	switch {

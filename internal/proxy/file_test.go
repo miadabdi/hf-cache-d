@@ -1358,3 +1358,55 @@ func TestLateWaiterGetsOwnStream(t *testing.T) {
 		return files["late.bin"] == hex.EncodeToString(sum[:])
 	}, "manifest entry via leader")
 }
+
+// TestMaxColdTransfersOverflowStreams: with a cap of 1, a second cold file
+// while the first streams must NOT queue — it streams through uncached
+// (bytes flow; the cache converges via the slot-holding leader).
+func TestMaxColdTransfersOverflowStreams(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.mu.Lock()
+	f.slow = 25
+	f.mu.Unlock()
+	bodyA := bytes.Repeat([]byte("A"), 64*1024)
+	bodyB := bytes.Repeat([]byte("B"), 64*1024)
+	addFile(t, f, "a.bin", bodyA)
+	addFile(t, f, "b.bin", bodyB)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	p.SetMaxColdTransfers(1)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// File A starts streaming (holds the only slot), then B fires.
+	aFirst := make(chan struct{})
+	go func() {
+		resp, err := http.Get(srv.URL + "/org/name/resolve/main/a.bin")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer resp.Body.Close()
+		one := make([]byte, 1)
+		io.ReadFull(resp.Body, one)
+		close(aFirst)
+		io.Copy(io.Discard, resp.Body)
+	}()
+	<-aFirst
+	start := time.Now()
+	resp, b := proxyGet(t, srv.URL+"/org/name/resolve/main/b.bin", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("overflow GET status = %d, want 200", resp.StatusCode)
+	}
+	if !bytes.Equal(b, bodyB) {
+		t.Fatalf("overflow body: got %d bytes, want %d", len(b), len(bodyB))
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("overflow GET took %v — capped requests must stream through, not queue", d)
+	}
+	// The cache still fills via the leader for A.
+	sumA := sha256.Sum256(bodyA)
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files["a.bin"] == hex.EncodeToString(sumA[:])
+	}, "manifest entry for a.bin")
+}

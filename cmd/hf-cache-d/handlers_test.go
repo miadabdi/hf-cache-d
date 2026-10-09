@@ -15,7 +15,7 @@ import (
 // newTestMux wires the mux with a proxy against a dead upstream: handler
 // tests here never touch the metadata lane's upstream path.
 func newTestMux() http.Handler {
-	mux, _ := newMuxAny("http://127.0.0.1:0", "", &nopStore{})
+	mux, _ := newMuxAny("http://127.0.0.1:0", "", &nopStore{}, 0)
 	return mux
 }
 
@@ -87,7 +87,7 @@ func TestIndexRoutes(t *testing.T) {
 // login/whoami, HfApi.whoami) must get a well-formed answer, not a 404; we
 // serve anonymously and never pretend to validate tokens.
 func TestWhoamiV2(t *testing.T) {
-	h, _ := newMuxAny("http://upstream.invalid", "", newMemStore())
+	h, _ := newMuxAny("http://upstream.invalid", "", newMemStore(), 0)
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 

@@ -626,11 +626,15 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 		return
 	}
 
-	if t := p.beginTransfer(key); t != nil {
+	// Leader decision EXACTLY once: beginTransfer returns the live
+	// transfer when someone else leads (nil means WE lead and are
+	// registered).
+	existing := p.beginTransfer(key)
+	if existing != nil {
 		// A transfer is already in flight: JOIN it as a subscriber and
 		// stream its bytes to our client as they happen (a byteless waiter
 		// is the fleet defect — hf_hub aborts after 10s of zero bytes).
-		if p.serveFromTransfer(w, r, t) {
+		if p.serveFromTransfer(w, r, existing) {
 			return
 		}
 		// Join window closed (the tee loop is already streaming — joining
@@ -640,10 +644,22 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 		p.streamThrough(w, r, repo, sha, file)
 		return
 	}
-	// We are the leader: run the transfer to completion (detached from our
-	// client's context so a disconnect never aborts the cache fill).
 	t := p.currentTransfer(key)
 	defer p.endTransfer(key, t, nil) // sole endTransfer: no double-close
+
+	// MAX_COLD_TRANSFERS: leaders hold a slot for their whole transfer;
+	// when the cap is full this would-be leader deregisters and streams
+	// through uncached rather than queueing — bytes now; the cache
+	// converges via the slot-holding leaders. Retires the
+	// unbounded-detached-pull ponytail ceiling.
+	if p.coldSlots != nil && !p.coldSlots.TryAcquire(1) {
+		p.endTransfer(key, t, nil)
+		p.streamThrough(w, r, repo, sha, file)
+		return
+	}
+	if p.coldSlots != nil {
+		defer p.coldSlots.Release(1)
+	}
 
 	ctx := context.Background() // detached: see comment above
 	p.m.AddMiss()

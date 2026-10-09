@@ -43,7 +43,7 @@ func main() {
 		log.Fatalf("s3 store: %v", err)
 	}
 
-	handler, p := newMux(cfg.HFUpstream, cfg.PushToken, st)
+	handler, p := newMux(cfg.HFUpstream, cfg.PushToken, st, cfg.MaxColdTransfers)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -98,21 +98,24 @@ func main() {
 //
 // /metricsz (Task 5) must also mount on the PARENT mux (as a literal or
 // subtree, which always wins over "/"); anything left falls to the file lane.
-func newMux(upstream, pushToken string, st *store.Store) (http.Handler, *proxy.Proxy) {
+func newMux(upstream, pushToken string, st *store.Store, maxCold int) (http.Handler, *proxy.Proxy) {
 	// *store.Store satisfies muxStore; the indirection exists for the
 	// handler tests' in-memory fake.
-	return newMuxAny(upstream, pushToken, st)
+	return newMuxAny(upstream, pushToken, st, maxCold)
 }
 
 // newMuxAny is newMux over the narrow store interface, so handler tests
 // can pass their in-memory fake while production passes *store.Store.
 // Returned proxy feeds the integrity self-check's manifest source.
-func newMuxAny(upstream, pushToken string, st muxStore) (http.Handler, *proxy.Proxy) {
+func newMuxAny(upstream, pushToken string, st muxStore, maxCold int) (http.Handler, *proxy.Proxy) {
 	// The sealed-local index cache is shared: the proxy reads it (shadowing
 	// rule) and the push lane refreshes it on seal.
 	ix := local.NewIndexes(st)
 	p := proxy.New(upstream, st)
 	p.SetLocalIndexes(ix)
+	if maxCold > 0 {
+		p.SetMaxColdTransfers(maxCold)
+	}
 
 	pl := push.New(pushToken, st, ix)
 	mux := http.NewServeMux()

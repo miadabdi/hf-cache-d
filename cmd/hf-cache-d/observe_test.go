@@ -89,7 +89,7 @@ func TestVanishedSealedObjectDoesNotLogHit(t *testing.T) {
 	previous := metrics.Default
 	metrics.Default = &metrics.Counters{}
 	defer func() { metrics.Default = previous }()
-	mux, _ := newMuxAny(up.URL, "", st)
+	mux, _ := newMuxAny(up.URL, "", st, 0)
 	var lines bytes.Buffer
 	wrapped := logMiddleware(&metrics.Counters{}, log.New(&lines, "", 0))(mux)
 	req := httptest.NewRequest(http.MethodHead, "/org/name/resolve/"+sha+"/f.bin", nil)
@@ -124,7 +124,7 @@ func TestMetricszCountsAcrossRequests(t *testing.T) {
 	t.Cleanup(up.Close)
 
 	st := newMemStore()
-	mux, _ := newMuxAny(up.URL, "sekrit", st)
+	mux, _ := newMuxAny(up.URL, "sekrit", st, 0)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -161,7 +161,7 @@ func TestMetricszCountsAcrossRequests(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	t.Cleanup(upFail.Close)
-	mux2, _ := newMuxAny(upFail.URL, "sekrit", newMemStore())
+	mux2, _ := newMuxAny(upFail.URL, "sekrit", newMemStore(), 0)
 	srv2 := httptest.NewServer(mux2)
 	t.Cleanup(srv2.Close)
 	httpGetBody(t, srv2.URL+"/api/models/org/other/revision/"+goodSHA)

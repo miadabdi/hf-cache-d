@@ -1,6 +1,6 @@
 module github.com/miadabdi/hf-cache-d
 
-go 1.22
+go 1.26.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.39.2
@@ -18,4 +18,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.9 // indirect
 	github.com/aws/smithy-go v1.23.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 )

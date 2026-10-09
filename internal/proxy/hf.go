@@ -23,6 +23,7 @@ import (
 	"github.com/miadabdi/hf-cache-d/internal/manifest"
 	"github.com/miadabdi/hf-cache-d/internal/metrics"
 	"github.com/miadabdi/hf-cache-d/internal/store"
+	"golang.org/x/sync/semaphore"
 )
 
 // storeAPI is the narrow slice of *store.Store the proxy consumes. The store
@@ -76,6 +77,10 @@ type Proxy struct {
 	sfMu      sync.Mutex
 	inflightT map[string]*transfer // object key -> live transfer
 
+	// coldSlots caps concurrent cold transfers (MAX_COLD_TRANSFERS, default
+	// 3; nil = uncapped, tests). Overflow requests stream through uncached.
+	coldSlots *semaphore.Weighted
+
 	// Sealed local models (Task 4). nil until SetLocalIndexes wires the
 	// push lane's index cache; reads then check locals BEFORE the public
 	// flow (the shadowing rule).
@@ -128,6 +133,14 @@ func New(upstream string, st storeAPI) *Proxy {
 		manifests: map[string]*manifest.Manifest{},
 		releaseMu: map[string]*sync.Mutex{},
 		m:         metrics.Default,
+	}
+}
+
+// SetMaxColdTransfers installs the concurrent-cold-transfer cap (tests
+// default to nil = uncapped; main wires the configured value).
+func (p *Proxy) SetMaxColdTransfers(n int) {
+	if n > 0 {
+		p.coldSlots = semaphore.NewWeighted(int64(n))
 	}
 }
 

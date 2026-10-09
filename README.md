@@ -83,6 +83,7 @@ the annotated template; nothing loads a file automatically).
 | `HF_UPSTREAM` | `https://huggingface.co` | Hub upstream for cache misses. |
 | `PUSH_TOKEN` | *(empty)* | Bearer token for the push lane. Empty disables pushing entirely (startup warning logged). |
 | `INTEGRITY_CHECK_INTERVAL` | `1h` | Periodic manifest integrity self-check (Go duration). `0` disables. Mismatch logs `CRITICAL: integrity mismatch:` — never deletes. |
+| `MAX_COLD_TRANSFERS` | `3` | Cap on concurrent cold upstream transfers. Overflow requests stream through uncached (bytes immediately, cache converges via slot-holding leaders) instead of queueing. Tune down on constrained egress (VPN), up on fat pipes. |
 
 ## HTTP endpoint contract
 
