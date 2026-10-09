@@ -854,6 +854,7 @@ func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Contex
 	buf := make([]byte, chunkSize)
 	clientGone, storeGone := false, false
 	var relayed int64
+	resumes := 0
 	failSubs := func(err error) {
 		// Best-effort error signal to subscribers: a non-nil chunk means
 		// failure; each subscriber's channel is buffered/dropped, so this
@@ -894,11 +895,26 @@ func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Contex
 			break
 		}
 		if rerr != nil {
-			// Upstream truncated or errored mid-body. The client already
-			// received the partial bytes (accepted v1 behavior); abort the
-			// upload and publish nothing so the next request re-fetches.
+			// Upstream truncated or errored mid-body (the VPN-jitter 2.3GB
+			// failure mode). RESUME from the byte offset via Range rather
+			// than restarting from zero: the client's stream, the hash and
+			// the store pipe continue seamlessly. Max 3 resumes; beyond
+			// that abort and publish nothing.
+			if resumes < maxResumes {
+				resumes++
+				rr, ok := p.resumeFrom(ctx, repo, sha, file, relayed)
+				if ok {
+					resp.Body.Close()
+					resp = rr
+					log.Printf("upstream read %s/%s cut at %d bytes (resume %d/3)", repo, file, relayed, resumes)
+					continue
+				}
+			}
+			// No resume possible (upstream refused/broken again): the
+			// client already received the partial bytes (accepted v1
+			// behavior); abort the upload and publish nothing.
 			pw.CloseWithError(fmt.Errorf("upstream read: %w", rerr))
-			log.Printf("upstream read %s/%s after %d bytes: %v (not published)", repo, file, relayed, rerr)
+			log.Printf("upstream read %s/%s after %d bytes: %v (no resume, not published)", repo, file, relayed, rerr)
 			failSubs(rerr)
 			return
 		}
@@ -919,6 +935,31 @@ func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Contex
 	if t != nil {
 		t.broadcast(nil) // clean EOF marker: subscribers finish their streams
 	}
+}
+
+// maxResumes bounds Range-resume attempts after mid-body upstream cuts.
+const maxResumes = 3
+
+// resumeFrom re-fetches the file from byte offset with a Range request,
+// returning the 206 response only when its Content-Range starts at exactly
+// the offset (anything else — 200, wrong start, error — means resume is
+// impossible and the caller aborts).
+func (p *Proxy) resumeFrom(ctx context.Context, repo, sha, file string, offset int64) (*http.Response, bool) {
+	rr, err := p.fetchFile(ctx, http.MethodGet, resolvePath(repo, sha, file), fmt.Sprintf("bytes=%d-", offset))
+	if err != nil {
+		return nil, false
+	}
+	if rr.StatusCode != http.StatusPartialContent {
+		rr.Body.Close()
+		return nil, false
+	}
+	cr := rr.Header.Get("Content-Range") // bytes <offset>-<end>/<total>
+	var start int64
+	if _, err := fmt.Sscanf(cr, "bytes %d-", &start); err != nil || start != offset {
+		rr.Body.Close()
+		return nil, false
+	}
+	return rr, true
 }
 
 // relayStatus relays a non-200 upstream GET answer (e.g. a 304 or 404 that

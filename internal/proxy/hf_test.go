@@ -61,6 +61,7 @@ type fakeUpstream struct {
 	files    map[string][]byte // repo-relative path -> body served for repo@main
 	lfs      map[string]bool   // repo-relative path -> served via 302 with X-Linked-* (default true when nil)
 	truncate int               // >0: serve only the first N bytes then hang up
+	truncateOnce int           // >0: cut the FIRST full GET at N bytes once (resume tests), then serve fully
 	slow     int               // >0: CDN ms sleep per 8KiB chunk (disconnect tests)
 	xetMode  bool              // CDN hop carries only its CAS ETag (no X-Linked-ETag), like xet-backed LFS
 	cdnSeen  map[string]int    // fake-CDN request counts by path (not query)
@@ -77,6 +78,10 @@ func newFakeUpstream(t *testing.T) (*httptest.Server, *fakeUpstream) {
 		rest, _ := strings.CutPrefix(strings.TrimPrefix(r.URL.Path, "/"+f.repo+"/"), "resolve/")
 		_, fname, _ := strings.Cut(rest, "/")
 		file, truncate, slow, xet := f.files[fname], f.truncate, f.slow, f.xetMode
+		if f.truncateOnce > 0 && r.Header.Get("Range") == "" {
+			truncate = f.truncateOnce
+			f.truncateOnce = 0 // one-shot: only the FIRST full GET is cut
+		}
 		f.mu.Unlock()
 		if file == nil {
 			http.NotFound(w, r)
@@ -267,7 +272,9 @@ func fakeETag(body []byte) string {
 	return hex.EncodeToString(sum[:])[:32]
 }
 
-// parseTestRange parses a single "bytes=a-b" range against a body length.
+// parseTestRange parses a single "bytes=a-b" or open-ended "bytes=a-"
+// range against a body length (real HF supports open-ended resumes; the
+// fake must too or resume tests are unfalsifiable).
 func parseTestRange(rg string, size int) (start, end int, ok bool) {
 	rg, found := strings.CutPrefix(rg, "bytes=")
 	if !found || strings.Contains(rg, ",") {
@@ -284,8 +291,9 @@ func parseTestRange(rg string, size int) (start, end int, ok bool) {
 	if err != nil || start < 0 {
 		return 0, 0, false
 	}
-	end, err = strconv.Atoi(b)
-	if err != nil || end < start {
+	if b == "" {
+		end = size - 1 // open-ended: through EOF
+	} else if end, err = strconv.Atoi(b); err != nil || end < start {
 		return 0, 0, false
 	}
 	if start >= size {

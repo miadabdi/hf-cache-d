@@ -1410,3 +1410,38 @@ func TestMaxColdTransfersOverflowStreams(t *testing.T) {
 		return files["a.bin"] == hex.EncodeToString(sumA[:])
 	}, "manifest entry for a.bin")
 }
+
+// TestUpstreamTruncationResumes: a mid-body upstream cut (VPN jitter, the
+// 2.3GB-shard failure mode) must resume from the byte offset via Range,
+// not restart from zero — the client sees one seamless stream and the
+// re-pulled bytes are only the remainder.
+func TestUpstreamTruncationResumes(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	body := bytes.Repeat([]byte("R"), 200*1024) // 200 KiB
+	sum := addFile(t, f, "res.bin", body)
+	// Cut the FIRST full GET at 64 KiB; the resume GET completes.
+	f.mu.Lock()
+	f.truncateOnce = 64 * 1024
+	f.mu.Unlock()
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	resp, got := proxyGet(t, srv.URL+"/org/name/resolve/main/res.bin", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (resumed stream)", resp.StatusCode)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body: got %d bytes, want %d (seamless after resume)", len(got), len(body))
+	}
+	// Cache publishes the correct full hash despite the cut.
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files["res.bin"] == sum
+	}, "manifest entry with full-body hash")
+	// Exactly one resume happened (2 upstream full GETs: cut + remainder).
+	if n := f.cdnSeen["/org/name/resolve/"+sha1+"/res.bin"]; n != 2 {
+		t.Errorf("upstream GETs = %d, want 2 (original cut + one Range resume, no from-zero restart)", n)
+	}
+}
