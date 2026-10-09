@@ -1036,7 +1036,7 @@ func TestConcurrentColdGetSingleflight(t *testing.T) {
 	wg.Wait()
 	for i, got := range results {
 		if !bytes.Equal(got, body) {
-			t.Errorf("cold GET %d body mismatch (%d bytes)", i, len(got))
+			t.Errorf("cold GET %d body mismatch (%d bytes, got %d want %d)", i, len(got), len(got), len(body))
 		}
 	}
 
@@ -1202,4 +1202,159 @@ func TestColdNonLFSHeadCompleteMetadata(t *testing.T) {
 	if got := resp.Header.Get("ETag"); got == "" {
 		t.Error("ETag empty — hf_hub raises FileMetadataError before size logic; the followed hop's ETag must be relayed")
 	}
+}
+
+// TestFanoutStreamsToAllWaiters: concurrent cold GETs in the leader's join
+// window must all receive the FULL body as it streams (fan-out), not block
+// byteless on a done-channel until hf_hub's 10s read timeout kills them —
+// the v0.1.5 fleet defect (GET ... 200 0B 10.009s).
+func TestFanoutStreamsToAllWaiters(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.mu.Lock()
+	f.slow = 30 // ms per 8KiB: the join window stays open long enough
+	f.mu.Unlock()
+	body := bytes.Repeat([]byte("fanout!"), 128*1024) // ~896 KiB
+	addFile(t, f, "fan.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// One leader, three joiners. The joiners fire AFTER the leader is
+	// mid-stream, so they deterministically take the waiter path — and the
+	// test asserts every waiter completes quickly (hf_hub aborts after 10s
+	// of zero bytes; the fleet defect was byteless waiters).
+	leaderStarted := make(chan struct{})
+	const n = 4
+	var wg sync.WaitGroup
+	got := make([][]byte, n)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, b := proxyGet(t, srv.URL+"/org/name/resolve/main/fan.bin", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("leader status = %d, want 200", resp.StatusCode)
+		}
+		got[0] = b
+	}()
+	// Give the leader a 300ms head start mid-drip, then release the joiners.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		close(leaderStarted)
+	}()
+	<-leaderStarted
+	first := make(chan time.Duration, n-1)
+	for i := 1; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start := time.Now()
+			resp, err := http.Get(srv.URL + "/org/name/resolve/main/fan.bin")
+			if err != nil {
+				t.Errorf("waiter %d: %v", i, err)
+				return
+			}
+			defer resp.Body.Close()
+			one := make([]byte, 1)
+			if _, err := io.ReadFull(resp.Body, one); err != nil {
+				t.Errorf("waiter %d first byte: %v", i, err)
+				return
+			}
+			first <- time.Since(start)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("waiter %d status = %d, want 200", i, resp.StatusCode)
+				return
+			}
+			if xc := resp.Header.Get("X-Cache"); xc == "" {
+				t.Errorf("waiter %d: no X-Cache", i)
+			}
+			rest, _ := io.ReadAll(resp.Body)
+			got[i] = append(one, rest...)
+		}(i)
+	}
+	wg.Wait()
+	close(first)
+	for d := range first {
+		if d > 1*time.Second {
+			t.Errorf("waiter first byte after %v — waiters must stream immediately, not stall (fleet defect; hf_hub aborts at 10s)", d)
+		}
+	}
+	for i := range got {
+		if !bytes.Equal(got[i], body) {
+			t.Errorf("waiter %d body: got %d bytes, want %d (full stream)", i, len(got[i]), len(body))
+		}
+	}
+}
+
+// TestLateWaiterGetsOwnStream: a request arriving AFTER the join window
+// closed (leader already streaming) must not block byteless — it serves
+// via its own upstream stream (uncached), so every cold GET returns bytes.
+func TestLateWaiterGetsOwnStream(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.mu.Lock()
+	f.slow = 40
+	f.mu.Unlock()
+	body := bytes.Repeat([]byte("late!"), 200*1024) // ~800 KiB
+	addFile(t, f, "late.bin", body)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// Waiter must see FIRST BYTES while the leader still streams: hf_hub
+	// aborts after 10s of zero bytes — the fleet defect. The leader drips
+	// ~110 chunks at 30ms (~3.3s), so first-byte-under-1s is decisive.
+	resp0 := make(chan *http.Response, 1)
+	go func() {
+		r, err := http.Get(srv.URL + "/org/name/resolve/main/fan.bin")
+		if err != nil {
+			resp0 <- nil
+			return
+		}
+		buf := make([]byte, 1)
+		if _, err := io.ReadFull(r.Body, buf); err != nil {
+			r.Body.Close()
+			resp0 <- nil
+			return
+		}
+		resp0 <- r
+	}()
+	var leaderResp *http.Response
+	select {
+	case leaderResp = <-resp0:
+	case <-time.After(1 * time.Second):
+		t.Fatal("first byte took >1s while leader streamed — waiters stall byteless (the fleet defect)")
+	}
+	leaderResp.Body.Close()
+
+	// Leader: read the first chunk, then (window closed) fire the late GET.
+	leader := make(chan []byte, 1)
+	go func() {
+		resp, err := http.Get(srv.URL + "/org/name/resolve/main/late.bin")
+		if err != nil {
+			leader <- nil
+			return
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 8192)
+		n, _ := resp.Body.Read(buf) // first chunk arrives → join window over
+		leader <- buf[:n]
+		io.Copy(io.Discard, resp.Body)
+	}()
+	if first := <-leader; first == nil {
+		t.Fatal("leader stream failed to start")
+	}
+	resp, b := proxyGet(t, srv.URL+"/org/name/resolve/main/late.bin", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("late waiter status = %d, want 200", resp.StatusCode)
+	}
+	if !bytes.Equal(b, body) {
+		t.Fatalf("late waiter body: got %d bytes, want %d (own full stream)", len(b), len(body))
+	}
+	// The cache still converges via the leader exactly once.
+	sum := sha256.Sum256(body)
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return files["late.bin"] == hex.EncodeToString(sum[:])
+	}, "manifest entry via leader")
 }

@@ -72,9 +72,9 @@ type Proxy struct {
 	relMu     sync.Mutex
 	releaseMu map[string]*sync.Mutex // repo-scoped manifest key -> RMW lock
 
-	// Singleflight state: one upstream transfer per object key.
-	sfMu     sync.Mutex
-	inflight map[string]chan struct{} // object key -> closed when transfer done
+	// Singleflight + fan-out state: one upstream transfer per object key.
+	sfMu      sync.Mutex
+	inflightT map[string]*transfer // object key -> live transfer
 
 	// Sealed local models (Task 4). nil until SetLocalIndexes wires the
 	// push lane's index cache; reads then check locals BEFORE the public

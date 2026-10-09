@@ -626,39 +626,24 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 		return
 	}
 
-	if !p.beginTransfer(key) {
-		// A transfer is already in flight for this object: wait for it,
-		// bounded by this request's context, then re-check the manifest.
-		if ch := p.waitTransfer(r.Context(), key); ch != nil {
-			select {
-			case <-ch:
-			case <-r.Context().Done():
-				return // client gave up; the leader keeps caching
-			}
-		}
-		if _, _, ok := p.fileEntry(r.Context(), repo, sha, file); ok {
-			p.serveGetMissServedWarm(w, r, repo, sha, file, key)
+	if t := p.beginTransfer(key); t != nil {
+		// A transfer is already in flight: JOIN it as a subscriber and
+		// stream its bytes to our client as they happen (a byteless waiter
+		// is the fleet defect — hf_hub aborts after 10s of zero bytes).
+		if p.serveFromTransfer(w, r, t) {
 			return
 		}
-		// The leader failed: take over rather than 502 behind its failure.
-		if !p.beginTransfer(key) {
-			// Lost the takeover race; wait once more.
-			if ch := p.waitTransfer(r.Context(), key); ch != nil {
-				select {
-				case <-ch:
-				case <-r.Context().Done():
-					return
-				}
-			}
-			if _, _, ok := p.fileEntry(r.Context(), repo, sha, file); ok {
-				p.serveGetMissServedWarm(w, r, repo, sha, file, key)
-				return
-			}
-			p.writeErr(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+		// Join window closed (the tee loop is already streaming — joining
+		// now would deliver a file missing its head). This client streams
+		// through its OWN upstream fetch, uncached: bytes now, cache
+		// converges via the leader. A byteless wait is never acceptable.
+		p.streamThrough(w, r, repo, sha, file)
+		return
 	}
-	defer p.endTransfer(key)
+	// We are the leader: run the transfer to completion (detached from our
+	// client's context so a disconnect never aborts the cache fill).
+	t := p.currentTransfer(key)
+	defer p.endTransfer(key, t, nil) // sole endTransfer: no double-close
 
 	ctx := context.Background() // detached: see comment above
 	p.m.AddMiss()
@@ -672,8 +657,105 @@ func (p *Proxy) serveGetMiss(w http.ResponseWriter, r *http.Request, repo, sha, 
 		p.relayStatus(w, resp, sha)
 		return
 	}
+	t.setHeaders(resp.Header)
 
-	p.teeTransfer(w, resp, ctx, repo, sha, file, key)
+	p.teeTransfer(w, resp, ctx, repo, sha, file, key, t)
+}
+
+// serveFromTransfer joins a live transfer as a subscriber and streams its
+// bytes to the client as they arrive. Returns true when the response was
+// fully handled here; false when the join window was already closed (the
+// caller falls back to warm-serve or takeover) or the subscriber was
+// dropped mid-stream (caller falls back to warm-serve; the leader keeps
+// caching either way).
+func (p *Proxy) serveFromTransfer(w http.ResponseWriter, r *http.Request, t *transfer) bool {
+	ch, ok := t.subscribe()
+	if !ok {
+		return false // window closed
+	}
+	defer t.unsubscribe(ch)
+
+	// Headers from the leader's upstream response (shared shape).
+	hdr := t.headers()
+	h := w.Header()
+	h.Set("X-Repo-Commit", "") // replaced below
+	for _, k := range []string{"Content-Type", "Content-Length"} {
+		if v := hdr.Get(k); v != "" {
+			h.Set(k, v)
+		}
+	}
+	h.Set("X-Cache", "MISS")
+	h.Set("Accept-Ranges", "bytes")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	for chunk := range ch {
+		if chunk == nil {
+			flusher.Flush()
+			return true // clean EOF from the leader
+		}
+		if _, err := w.Write(chunk); err != nil {
+			return true // our client left; leader unaffected
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	// Channel closed without EOF marker: we were dropped (slow) or the
+	// leader failed. Fall through — the caller re-checks the manifest.
+	return false
+}
+
+// currentTransfer returns the live transfer for key (the leader's own).
+func (p *Proxy) currentTransfer(key string) *transfer {
+	p.sfMu.Lock()
+	defer p.sfMu.Unlock()
+	return p.inflightT[key]
+}
+
+// streamThrough serves a late waiter from its OWN upstream fetch without
+// touching the store (the leader owns the cache fill). Used when the join
+// window closed mid-transfer: every client must see bytes immediately,
+// even at the cost of one extra upstream stream.
+func (p *Proxy) streamThrough(w http.ResponseWriter, r *http.Request, repo, sha, file string) {
+	p.m.AddMiss()
+	resp, err := p.fetchFile(r.Context(), http.MethodGet, resolvePath(repo, sha, file), "")
+	if err != nil {
+		p.fail(w, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		p.relayStatus(w, resp, sha)
+		return
+	}
+	h := w.Header()
+	h.Set("X-Repo-Commit", sha)
+	h.Set("X-Cache", "MISS")
+	h.Set("Accept-Ranges", "bytes")
+	if v := resp.Header.Get("Content-Type"); v != "" {
+		h.Set("Content-Type", v)
+	}
+	if v := resp.Header.Get("Content-Length"); v != "" {
+		h.Set("Content-Length", v)
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, chunkSize)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // client left; nothing was cached, nothing to clean up
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 // serveGetMissServedWarm answers a waiter whose leader finished caching:
@@ -695,10 +777,11 @@ func ctxBackground() context.Context { return context.Background() }
 // a cold ranged relay returned 206: the file exists, so warming it makes
 // range-only access patterns converge to HITs.
 func (p *Proxy) warmCold(ctx context.Context, repo, sha, file, key string) {
-	if !p.beginTransfer(key) {
+	if p.beginTransfer(key) != nil {
 		return // a full GET is already warming it
 	}
-	defer p.endTransfer(key)
+	t := p.currentTransfer(key)
+	defer p.endTransfer(key, t, nil) // sole endTransfer: no double-close
 
 	resp, err := p.fetchFile(ctx, http.MethodGet, resolvePath(repo, sha, file), "")
 	if err != nil {
@@ -708,15 +791,17 @@ func (p *Proxy) warmCold(ctx context.Context, repo, sha, file, key string) {
 	if resp.StatusCode != http.StatusOK {
 		return
 	}
-	p.teeTransfer(io.Discard, resp, ctx, repo, sha, file, key)
+	t.setHeaders(resp.Header)
+	p.teeTransfer(io.Discard, resp, ctx, repo, sha, file, key, t)
 }
 
 // teeTransfer streams the upstream body to client (an io.Writer — the real
 // response or io.Discard for background warms) while teeing into a
-// streaming S3 upload and hashing, publishing the manifest entry only
-// after upstream EOF plus a successful store Put. Headers are written only
-// when client is an http.ResponseWriter.
-func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Context, repo, sha, file, key string) {
+// streaming S3 upload, hashing, and — when t is non-nil — broadcasting
+// every chunk to the transfer's subscribers (fan-out). The manifest entry
+// is published only after upstream EOF plus a successful store Put.
+// Headers are written only when client is an http.ResponseWriter.
+func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Context, repo, sha, file, key string, t *transfer) {
 	rw, isHTTP := w.(http.ResponseWriter)
 	if isHTTP {
 		h := rw.Header()
@@ -753,6 +838,15 @@ func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Contex
 	buf := make([]byte, chunkSize)
 	clientGone, storeGone := false, false
 	var relayed int64
+	failSubs := func(err error) {
+		// Best-effort error signal to subscribers: a non-nil chunk means
+		// failure; each subscriber's channel is buffered/dropped, so this
+		// never blocks.
+		if t != nil {
+			t.broadcast([]byte{0})
+		}
+		_ = err
+	}
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
@@ -765,6 +859,13 @@ func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Contex
 				} else if flusher != nil {
 					flusher.Flush()
 				}
+			}
+			if t != nil {
+				// Fan-out: each subscriber needs its OWN copy — buf is
+				// reused by the next Read, and channel sends don't copy.
+				cp := make([]byte, n)
+				copy(cp, buf[:n])
+				t.broadcast(cp)
 			}
 			if !storeGone {
 				if _, perr := pw.Write(buf[:n]); perr != nil {
@@ -782,6 +883,7 @@ func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Contex
 			// upload and publish nothing so the next request re-fetches.
 			pw.CloseWithError(fmt.Errorf("upstream read: %w", rerr))
 			log.Printf("upstream read %s/%s after %d bytes: %v (not published)", repo, file, relayed, rerr)
+			failSubs(rerr)
 			return
 		}
 	}
@@ -792,9 +894,15 @@ func (p *Proxy) teeTransfer(w io.Writer, resp *http.Response, ctx context.Contex
 		// Client got the full body; the partial object is garbage and stays
 		// unpublished. Task 6's integrity pass covers retention.
 		log.Printf("store put %s: %v (object is garbage, not published)", key, perr)
+		if t != nil {
+			t.broadcast([]byte{0}) // failure marker to subscribers
+		}
 		return
 	}
 	p.publishFile(ctx, repo, sha, file, hex.EncodeToString(hash.Sum(nil)), relayed)
+	if t != nil {
+		t.broadcast(nil) // clean EOF marker: subscribers finish their streams
+	}
 }
 
 // relayStatus relays a non-200 upstream GET answer (e.g. a 304 or 404 that
@@ -842,52 +950,122 @@ func (p *Proxy) relayColdRange(w http.ResponseWriter, r *http.Request, repo, sha
 	return resp.StatusCode
 }
 
-// ---- singleflight: one upstream transfer per object key ----
+// ---- singleflight + fan-out: one upstream transfer per object key ----
 //
-// inflight maps the S3 object key to a done channel closed when the
-// transfer finishes (success or failure). beginTransfer registers the
-// caller as leader (true) or reports a leader exists (false). Waiters
-// block on the channel, then re-check the manifest themselves: a HIT when
-// the leader published, a fresh takeover when it failed. The map is
-// bounded by concurrent transfers, not by request count.
+// inflight maps the S3 object key to its live transfer. The leader runs
+// the tee loop; concurrent waiters for the same key JOIN the transfer as
+// subscribers and receive the stream as it happens (a byteless waiter is
+// the fleet defect — hf_hub aborts after 10s of zero bytes). A subscriber
+// whose buffer fills (slow client) is dropped back to wait-for-manifest;
+// it can never stall the leader or other subscribers. The map is bounded
+// by concurrent transfers, not by request count.
 // ponytail: process-local; a second instance would need store-side
 // coordination to collapse cross-instance fetches.
 
-func (p *Proxy) beginTransfer(key string) bool {
-	p.sfMu.Lock()
-	defer p.sfMu.Unlock()
-	if p.inflight == nil {
-		p.inflight = map[string]chan struct{}{}
-	}
-	if _, busy := p.inflight[key]; busy {
-		return false
-	}
-	p.inflight[key] = make(chan struct{})
-	return true
+// fanBuffer is the subscriber queue depth (chunks). Beyond it a waiter is
+// dropped rather than allowed to back-pressure the leader.
+const fanBuffer = 8
+
+type transfer struct {
+	done chan struct{} // closed when the transfer finishes (any outcome)
+
+	mu       sync.Mutex
+	subs     map[chan []byte]bool // live subscriber chunk channels
+	hdr      http.Header          // captured response headers (set once)
+	hdrOK    bool
+	streamed bool // tee loop began broadcasting: late joiners get the fallback
+	err      error // terminal outcome for post-hoc waiters
 }
 
-// waitTransfer returns the done channel for an in-flight transfer, or nil
-// when none exists anymore.
-func (p *Proxy) waitTransfer(ctx context.Context, key string) <-chan struct{} {
-	p.sfMu.Lock()
-	defer p.sfMu.Unlock()
-	if ch, busy := p.inflight[key]; busy {
-		return ch
-	}
-	return nil
+func newTransfer() *transfer {
+	return &transfer{done: make(chan struct{}), subs: map[chan []byte]bool{}}
 }
 
-// endTransfer deregisters the caller's transfer and wakes every waiter.
-func (p *Proxy) endTransfer(key string) {
+func (t *transfer) setHeaders(h http.Header) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.hdrOK {
+		t.hdr = h.Clone()
+		t.hdrOK = true
+	}
+}
+
+// headers returns the captured upstream headers (nil until set).
+func (t *transfer) headers() http.Header {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.hdr
+}
+
+// subscribe registers a chunk channel; ok=false when the join window is
+// closed — the tee loop already started streaming (a late joiner would
+// miss the head) or the transfer finished. The caller then serves warm or
+// takes over.
+func (t *transfer) subscribe() (chan []byte, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.streamed {
+		return nil, false
+	}
+	select {
+	case <-t.done:
+		return nil, false
+	default:
+	}
+	ch := make(chan []byte, fanBuffer)
+	t.subs[ch] = true
+	return ch, true
+}
+
+// unsubscribe removes a subscriber (waiter gone or dropped).
+func (t *transfer) unsubscribe(ch chan []byte) {
+	t.mu.Lock()
+	delete(t.subs, ch)
+	t.mu.Unlock()
+}
+
+// broadcast hands one chunk to every live subscriber without blocking: a
+// full buffer drops that subscriber (it re-serves from the manifest once
+// done). A nil chunk signals successful EOF, a non-nil chunk with
+// len==1&&chunk[0]==0 is the failure marker.
+func (t *transfer) broadcast(chunk []byte) {
+	t.mu.Lock()
+	t.streamed = true
+	defer t.mu.Unlock()
+	for ch := range t.subs {
+		select {
+		case ch <- chunk:
+		default:
+			delete(t.subs, ch) // slow subscriber: drop, never stall the leader
+		}
+	}
+}
+
+func (p *Proxy) beginTransfer(key string) *transfer {
 	p.sfMu.Lock()
-	ch, busy := p.inflight[key]
-	if busy {
-		delete(p.inflight, key)
+	defer p.sfMu.Unlock()
+	if p.inflightT == nil {
+		p.inflightT = map[string]*transfer{}
+	}
+	if t, busy := p.inflightT[key]; busy {
+		return t
+	}
+	t := newTransfer()
+	p.inflightT[key] = t
+	return nil // caller is the leader
+}
+
+// endTransfer deregisters the transfer and wakes every remaining waiter.
+func (p *Proxy) endTransfer(key string, t *transfer, err error) {
+	p.sfMu.Lock()
+	if cur, busy := p.inflightT[key]; busy && cur == t {
+		delete(p.inflightT, key)
 	}
 	p.sfMu.Unlock()
-	if busy {
-		close(ch)
-	}
+	t.mu.Lock()
+	t.err = err
+	t.mu.Unlock()
+	close(t.done)
 }
 
 // fetchFile is the file lane's retrying fetch: one retry on connection
