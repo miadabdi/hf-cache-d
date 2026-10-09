@@ -370,7 +370,9 @@ func TestColdRangePassthroughNoCache(t *testing.T) {
 }
 
 // TestGetColdTruncationNoManifest verifies that an upstream truncation
-// mid-body leaves no manifest entry, and the next request re-fetches.
+// mid-body is RESUMED via Range (the client sees the full seamless body)
+// and the manifest publishes the complete hash. Truncation only defeats
+// the pull when resume is impossible.
 func TestGetColdTruncationNoManifest(t *testing.T) {
 	up, f := newFakeUpstream(t)
 	addFile(t, f, "t.bin", []byte("0123456789"))
@@ -379,7 +381,7 @@ func TestGetColdTruncationNoManifest(t *testing.T) {
 	srv := newTestServer(p)
 	defer srv.Close()
 
-	// First attempt truncated: client gets partial bytes (accepted v1).
+	// First attempt truncated at 4 bytes: the resume completes the stream.
 	f.mu.Lock()
 	f.truncate = 4
 	f.mu.Unlock()
@@ -391,29 +393,29 @@ func TestGetColdTruncationNoManifest(t *testing.T) {
 	}
 	got, rerr := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if rerr == nil {
-		t.Fatalf("expected read error on truncated body, got %d clean bytes", len(got))
+	if rerr != nil {
+		t.Fatalf("read error on resumed body: %v", rerr)
 	}
-	if !bytes.HasPrefix([]byte("0123456789"), got) {
-		t.Errorf("partial client bytes = %q, want prefix of body", got)
+	if !bytes.Equal([]byte("0123456789"), got) {
+		t.Errorf("resumed client bytes = %q, want full body", got)
 	}
 
-	// No manifest entry, so the next request is a MISS again.
+	// The resumed transfer published the manifest: the next request is a HIT.
 	f.mu.Lock()
 	f.truncate = 0
 	f.mu.Unlock()
+	sum := sha256.Sum256([]byte("0123456789"))
+	waitFor(t, 5*time.Second, func() bool {
+		files := readFileManifest(t, st, sha1)
+		return len(files) == 1 && files["t.bin"] == hex.EncodeToString(sum[:])
+	}, "manifest entry with complete hash after resume")
 	resp2, got2 := proxyGet(t, srv.URL+"/org/name/resolve/main/t.bin", nil)
-	if resp2.Header.Get("X-Cache") != "MISS" {
-		t.Fatalf("post-truncation X-Cache = %q, want MISS (re-fetch)", resp2.Header.Get("X-Cache"))
+	if resp2.Header.Get("X-Cache") != "HIT" {
+		t.Fatalf("post-resume X-Cache = %q, want HIT (cached via resumed transfer)", resp2.Header.Get("X-Cache"))
 	}
 	if !bytes.Equal(got2, []byte("0123456789")) {
-		t.Errorf("re-fetched body = %q", got2)
+		t.Errorf("warm body = %q", got2)
 	}
-	var files map[string]string
-	waitFor(t, 5*time.Second, func() bool {
-		files = readFileManifest(t, st, sha1)
-		return len(files) == 1 && files["t.bin"] != ""
-	}, "manifest entry after re-fetch")
 }
 
 // TestGetColdS3PutFailure: when the store Put fails, the client response
