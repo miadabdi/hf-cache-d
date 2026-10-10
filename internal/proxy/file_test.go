@@ -1413,6 +1413,56 @@ func TestMaxColdTransfersOverflowStreams(t *testing.T) {
 	}, "manifest entry for a.bin")
 }
 
+// TestMaxColdTransfersEvictionNoPanic: the cap-eviction path calls
+// endTransfer explicitly (deregister so same-key requests don't join a dead
+// transfer) and then returns into its own deferred endTransfer — closing
+// t.done twice panicked ("close of closed channel", the 12:19 gemma-pull
+// aborts). net/http recovers per-request panics, so this drives the handler
+// directly in the test goroutine where the panic can't hide.
+func TestMaxColdTransfersEvictionNoPanic(t *testing.T) {
+	up, f := newFakeUpstream(t)
+	f.mu.Lock()
+	f.slow = 25
+	f.mu.Unlock()
+	addFile(t, f, "a.bin", bytes.Repeat([]byte("A"), 64*1024))
+	bodyB := bytes.Repeat([]byte("B"), 64*1024)
+	addFile(t, f, "b.bin", bodyB)
+	st := newMemStore()
+	p, _ := newTestProxy(t, up.URL, st)
+	p.SetMaxColdTransfers(1)
+	srv := newTestServer(p)
+	defer srv.Close()
+
+	// File A starts streaming and holds the only cold slot.
+	aFirst := make(chan struct{})
+	go func() {
+		resp, err := http.Get(srv.URL + "/org/name/resolve/main/a.bin")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer resp.Body.Close()
+		one := make([]byte, 1)
+		io.ReadFull(resp.Body, one)
+		close(aFirst)
+		io.Copy(io.Discard, resp.Body)
+	}()
+	<-aFirst
+
+	// The evicted request for B runs in THIS goroutine: no server recover.
+	files := http.NewServeMux()
+	p.RegisterFiles(files)
+	req := httptest.NewRequest(http.MethodGet, "/org/name/resolve/main/b.bin", nil)
+	w := httptest.NewRecorder()
+	files.ServeHTTP(w, req) // panicked here before the fix
+	if w.Code != http.StatusOK {
+		t.Fatalf("evicted GET status = %d, want 200", w.Code)
+	}
+	if !bytes.Equal(w.Body.Bytes(), bodyB) {
+		t.Fatalf("evicted body: got %d bytes, want %d", len(w.Body.Bytes()), len(bodyB))
+	}
+}
+
 // TestUpstreamTruncationResumes: a mid-body upstream cut (VPN jitter, the
 // 2.3GB-shard failure mode) must resume from the byte offset via Range,
 // not restart from zero — the client sees one seamless stream and the

@@ -40,13 +40,13 @@ type Config struct {
 // failing fast with a message naming the missing variable.
 func LoadConfig() (Config, error) {
 	cfg := Config{
-		ListenAddr:  os.Getenv("LISTEN_ADDR"),
-		S3Endpoint:  strings.TrimSpace(os.Getenv("S3_ENDPOINT")),
-		S3Bucket:    strings.TrimSpace(os.Getenv("S3_BUCKET")),
-		S3AccessKey: strings.TrimSpace(os.Getenv("S3_ACCESS_KEY")),
-		S3SecretKey: strings.TrimSpace(os.Getenv("S3_SECRET_KEY")),
-		HFUpstream:  strings.TrimSpace(os.Getenv("HF_UPSTREAM")),
-		PushToken:   os.Getenv("PUSH_TOKEN"),
+		ListenAddr:    os.Getenv("LISTEN_ADDR"),
+		S3Endpoint:    strings.TrimSpace(os.Getenv("S3_ENDPOINT")),
+		S3Bucket:      strings.TrimSpace(os.Getenv("S3_BUCKET")),
+		S3AccessKey:   strings.TrimSpace(os.Getenv("S3_ACCESS_KEY")),
+		S3SecretKey:   strings.TrimSpace(os.Getenv("S3_SECRET_KEY")),
+		HFUpstream:    strings.TrimSpace(os.Getenv("HF_UPSTREAM")),
+		PushToken:     os.Getenv("PUSH_TOKEN"),
 		UpstreamToken: strings.TrimSpace(os.Getenv("HF_UPSTREAM_TOKEN")),
 	}
 	if cfg.ListenAddr == "" {

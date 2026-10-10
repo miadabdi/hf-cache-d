@@ -1032,6 +1032,7 @@ type transfer struct {
 	hdr      http.Header          // captured response headers (set once)
 	hdrOK    bool
 	streamed bool  // tee loop began broadcasting: late joiners get the fallback
+	finished bool  // guarded by mu: endTransfer already closed done
 	err      error // terminal outcome for post-hoc waiters
 }
 
@@ -1114,6 +1115,9 @@ func (p *Proxy) beginTransfer(key string) *transfer {
 }
 
 // endTransfer deregisters the transfer and wakes every remaining waiter.
+// Idempotent: the cap-eviction path calls it explicitly and then returns
+// into its own deferred call — the second close of t.done used to panic
+// (the 12:19 gemma-pull aborts). First terminal state wins.
 func (p *Proxy) endTransfer(key string, t *transfer, err error) {
 	p.sfMu.Lock()
 	if cur, busy := p.inflightT[key]; busy && cur == t {
@@ -1121,6 +1125,11 @@ func (p *Proxy) endTransfer(key string, t *transfer, err error) {
 	}
 	p.sfMu.Unlock()
 	t.mu.Lock()
+	if t.finished {
+		t.mu.Unlock()
+		return
+	}
+	t.finished = true
 	t.err = err
 	t.mu.Unlock()
 	close(t.done)
